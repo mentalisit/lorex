@@ -3,6 +3,7 @@ import json
 
 import pytest
 
+from custom_components.dahua import client as client_module
 from custom_components.dahua.client import DahuaClient, RaysharpAuthError
 
 REFUSAL = {
@@ -45,11 +46,25 @@ class FakeAuth:
 
 
 @pytest.fixture
-async def client():
-    client = DahuaClient("admin", "florian88", "d", 80, 554, None)
-    yield client
-    if client._raysharp_session is not None:
-        await client._raysharp_session.close()
+async def clients():
+    """Hands out clients for one NVR, the way a config entry per channel does."""
+    made = []
+
+    def make():
+        made.append(DahuaClient("admin", "florian88", "d", 80, 554, None))
+        return made[-1]
+
+    client_module._RAYSHARP_BLOCKS.clear()
+    yield make
+    client_module._RAYSHARP_BLOCKS.clear()
+    for client in made:
+        if client._raysharp_session is not None:
+            await client._raysharp_session.close()
+
+
+@pytest.fixture
+async def client(clients):
+    return clients()
 
 
 async def test_login_sends_a_version_like_every_other_call(client, monkeypatch):
@@ -72,3 +87,17 @@ async def test_a_refusal_is_not_retried_while_the_account_is_blocked(client, mon
         await client.async_login()
 
     assert len(auth.payloads) == 1, "the client kept knocking while blocked"
+
+
+async def test_the_block_is_the_accounts_not_the_clients(clients, monkeypatch):
+    """Every channel of an NVR is its own entry, and the device blocks the user."""
+    auth = FakeAuth([FakeResponse(400, json.dumps(REFUSAL))])
+    monkeypatch.setattr("custom_components.dahua.client.DigestAuth", auth)
+
+    with pytest.raises(RaysharpAuthError, match="rejected the credentials"):
+        await clients().async_login()
+
+    with pytest.raises(RaysharpAuthError, match="not retrying"):
+        await clients().async_login()
+
+    assert len(auth.payloads) == 1, "a second entry spent another of the device's tries"
