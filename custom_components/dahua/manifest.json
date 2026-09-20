@@ -2,7 +2,8 @@
   "domain": "lorex_raysharp",
   "name": "Lorex Raysharp NVR Integration",
   "after_dependencies": [
-    "tag"
+    "tag",
+    "ffmpeg"
   ],
   "codeowners": [
     "@rroller"
@@ -14,5 +15,5 @@
   "documentation": "https://github.com/rroller/dahua",
   "iot_class": "local_polling",
   "issue_tracker": "https://github.com/rroller/dahua/issues",
-  "version": "0.10.12"
+  "version": "0.10.13"
 }

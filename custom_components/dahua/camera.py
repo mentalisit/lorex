@@ -8,6 +8,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_platform
 from homeassistant.components.camera import Camera, CameraEntityFeature
+from homeassistant.components.ffmpeg import async_get_image
 
 from custom_components.dahua import DahuaDataUpdateCoordinator
 from custom_components.dahua.entity import DahuaBaseEntity
@@ -323,13 +324,33 @@ class DahuaCamera(DahuaBaseEntity, Camera):
         return self._unique_id
 
     async def async_camera_image(self, width: int | None = None, height: int | None = None):
-        """Return a still image response from the camera."""
+        """Return a still image response from the camera.
+
+        Prefer the Raysharp Snapshot API; if that fails (common when another
+        web session holds the NVR lock), grab one frame from the same RTSP URL
+        Frigate uses.
+        """
         try:
             image = await self._coordinator.client.async_get_snapshot(self._channel_number)
-            # Empty bytes make camera_proxy return HTTP 500; treat as no image.
-            return image or None
-        except Exception as ex:
-            _LOGGER.debug("Snapshot failed for channel %s: %s", self._channel_number, ex)
+            if image:
+                return image
+        except Exception as ex:  # pylint: disable=broad-except
+            _LOGGER.debug(
+                "Snapshot API failed for channel %s: %s", self._channel_number, ex
+            )
+
+        stream_url = await self.stream_source()
+        try:
+            return await async_get_image(
+                self.hass, stream_url, width=width, height=height
+            )
+        except Exception as ex:  # pylint: disable=broad-except
+            _LOGGER.warning(
+                "RTSP snapshot failed for %s (%s): %s",
+                self._name,
+                stream_url.split("@")[-1] if "@" in stream_url else stream_url,
+                ex,
+            )
             return None
 
     @property

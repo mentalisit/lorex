@@ -994,20 +994,16 @@ class DahuaClient:
         """
         Returns the RTSP URL for Lorex/Raysharp NVR streaming.
 
-        Verified on RN101A Preview/StreamUrl/Get:
-        rtsp://<nvr>:80/rtsp/streaming?channel=1&subtype=0  (main)
-        rtsp://<nvr>:80/rtsp/streaming?channel=1&subtype=1  (sub)
+        Working Frigate URL on RN101A:
+        rtsp://user:pass@192.168.88.222:554/rtsp/streaming?channel=02&subtype=1
 
-        The device advertises port 80 for RTSP (not 554). When the config still
-        has the Dahua default of 554, prefer 80 in Raysharp mode.
+        Channel is 1-based and zero-padded to two digits. Port comes from the
+        integration config (typically 554) -- do not rewrite it.
         """
         key = self.raysharp_channel_key(channel)
         chn_num = int(key[2:])
+        channel_str = f"{chn_num:02d}"
         subtype_str = "0" if subtype == 0 else "1"
-
-        rtsp_port = self._rtsp_port
-        if self.raysharp_mode and int(rtsp_port) == 554:
-            rtsp_port = 80
 
         auth = ""
         if self._username:
@@ -1017,8 +1013,8 @@ class DahuaClient:
                 auth = f"{quote(self._username, safe='')}@"
 
         return (
-            f"rtsp://{auth}{self._address}:{rtsp_port}"
-            f"/rtsp/streaming?channel={chn_num}&subtype={subtype_str}"
+            f"rtsp://{auth}{self._address}:{self._rtsp_port}"
+            f"/rtsp/streaming?channel={channel_str}&subtype={subtype_str}"
         )
 
     async def async_get_channel_info(self) -> dict:
