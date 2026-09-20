@@ -952,18 +952,62 @@ class DahuaClient:
             num = 1
         return f"CH{num}"
 
+    async def async_get_snapshot(self, channel_number: int) -> bytes:
+        """
+        Takes a snapshot of the camera and returns the binary JPEG data via Raysharp API.
+        channel_number is 1-based (channel index 0 → channel_number 1).
+
+        Lorex RN101A returns JSON: ``{"result":"success","data":{"img_data":"<base64 jpeg>"}}``.
+        """
+        ch_key = self.raysharp_channel_key(channel_number)
+        payload = {"version": "1.0", "data": {"channel": ch_key}}
+        try:
+            resp = await self.async_post_json("/API/Snapshot/Get", payload)
+            if isinstance(resp, bytes):
+                return resp
+            if isinstance(resp, dict):
+                import base64
+
+                data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+                img_b64 = (
+                    (data or {}).get("img_data")
+                    or (data or {}).get("image")
+                    or resp.get("img_data")
+                    or resp.get("image")
+                )
+                if not img_b64:
+                    _LOGGER.warning(
+                        "Raysharp snapshot for %s returned no img_data: %s",
+                        ch_key,
+                        list((data or {}).keys()) if data else resp.keys(),
+                    )
+                    return b""
+                if isinstance(img_b64, str) and img_b64.startswith("data:"):
+                    img_b64 = img_b64.split(",", 1)[-1]
+                return base64.b64decode(img_b64)
+            return b""
+        except RaysharpApiError as err:
+            _LOGGER.warning("Raysharp snapshot failed for channel %s: %s", ch_key, err)
+            return b""
+
     def get_rtsp_stream_url(self, channel: int | str, subtype: int) -> str:
         """
         Returns the RTSP URL for Lorex/Raysharp NVR streaming.
 
         Verified on RN101A Preview/StreamUrl/Get:
-        rtsp://host/rtsp/streaming?channel=1&subtype=0  (main)
-        rtsp://host/rtsp/streaming?channel=1&subtype=1  (sub)
-        Channel is 1-based and not zero-padded.
+        rtsp://<nvr>:80/rtsp/streaming?channel=1&subtype=0  (main)
+        rtsp://<nvr>:80/rtsp/streaming?channel=1&subtype=1  (sub)
+
+        The device advertises port 80 for RTSP (not 554). When the config still
+        has the Dahua default of 554, prefer 80 in Raysharp mode.
         """
         key = self.raysharp_channel_key(channel)
         chn_num = int(key[2:])
         subtype_str = "0" if subtype == 0 else "1"
+
+        rtsp_port = self._rtsp_port
+        if self.raysharp_mode and int(rtsp_port) == 554:
+            rtsp_port = 80
 
         auth = ""
         if self._username:
@@ -973,7 +1017,7 @@ class DahuaClient:
                 auth = f"{quote(self._username, safe='')}@"
 
         return (
-            f"rtsp://{auth}{self._address}:{self._rtsp_port}"
+            f"rtsp://{auth}{self._address}:{rtsp_port}"
             f"/rtsp/streaming?channel={chn_num}&subtype={subtype_str}"
         )
 
@@ -1008,7 +1052,6 @@ class DahuaClient:
         POST /API/PreviewChannel/Floodlight2AudioAlarm/Set
         """
         ch_key = self.raysharp_channel_key(channel)
-        # Read current state so we only toggle the requested outputs.
         current = {
             "floodlight_switch": False,
             "floodlight_value": floodlight_value,
@@ -1025,9 +1068,13 @@ class DahuaClient:
                         current.update(
                             {
                                 "floodlight_switch": bool(fa.get("floodlight_switch")),
-                                "floodlight_value": int(fa.get("floodlight_value", floodlight_value)),
+                                "floodlight_value": int(
+                                    fa.get("floodlight_value", floodlight_value)
+                                ),
                                 "audioAlarm_switch": bool(fa.get("audioAlarm_switch")),
-                                "audioAlarm_value": int(fa.get("audioAlarm_value", audio_alarm_value)),
+                                "audioAlarm_value": int(
+                                    fa.get("audioAlarm_value", audio_alarm_value)
+                                ),
                                 "redBlueLight_switch": bool(fa.get("redBlueLight_switch")),
                             }
                         )
@@ -1051,28 +1098,6 @@ class DahuaClient:
         if isinstance(resp, dict) and resp.get("result") == "success":
             return resp
         raise RaysharpApiError(f"Failed Floodlight2AudioAlarm/Set for {ch_key}: {resp}")
-
-    async def async_get_snapshot(self, channel_number: int) -> bytes:
-        """
-        Takes a snapshot of the camera and returns the binary JPEG data via Raysharp API.
-        channel_number is 1-based (channel index 0 → channel_number 1).
-        """
-        ch_key = self.raysharp_channel_key(channel_number)
-        payload = {"version": "1.0", "data": {"channel": ch_key}}
-        try:
-            resp = await self.async_post_json("/API/Snapshot/Get", payload)
-            if isinstance(resp, bytes):
-                return resp
-            if isinstance(resp, dict):
-                import base64
-
-                img_b64 = resp.get("data", {}).get("image") or resp.get("image")
-                if img_b64:
-                    return base64.b64decode(img_b64)
-            return b""
-        except RaysharpApiError as err:
-            _LOGGER.warning("Raysharp snapshot failed for channel %s: %s", ch_key, err)
-            return b""
 
     async def async_get_system_info(self) -> dict:
         """

@@ -325,7 +325,9 @@ class DahuaCamera(DahuaBaseEntity, Camera):
     async def async_camera_image(self, width: int | None = None, height: int | None = None):
         """Return a still image response from the camera."""
         try:
-            return await self._coordinator.client.async_get_snapshot(self._channel_number)
+            image = await self._coordinator.client.async_get_snapshot(self._channel_number)
+            # Empty bytes make camera_proxy return HTTP 500; treat as no image.
+            return image or None
         except Exception as ex:
             _LOGGER.debug("Snapshot failed for channel %s: %s", self._channel_number, ex)
             return None
