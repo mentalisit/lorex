@@ -211,6 +211,31 @@ def _digest_state(device: str, username: str) -> dict:
     return state
 
 
+# A refused Raysharp login blocks the account on the device for
+# block_remain_time seconds, and every attempt made during the block restarts
+# it. The block belongs to the account, so a per-client deadline does nothing:
+# one NVR carries a config entry per channel, all four log in within the same
+# second, and a fresh entry (or a reload) starts with an empty deadline. Keyed
+# by device and user for the same reasons the digest state is.
+_RAYSHARP_BLOCKS: dict = {}
+
+# The shortest hold to take after a refusal the device did not put a time on.
+RAYSHARP_MIN_BLOCK_SECONDS = 180
+
+# One login in flight per account, so the channels of an NVR queue behind the
+# first attempt instead of spending four of the device's few tries at once.
+_RAYSHARP_LOGIN_LOCKS: dict = {}
+
+
+def _raysharp_login_lock(device: str, username: str) -> asyncio.Lock:
+    """The login lock shared by every client for this device and user."""
+    key = (device, username)
+    lock = _RAYSHARP_LOGIN_LOCKS.get(key)
+    if lock is None:
+        lock = _RAYSHARP_LOGIN_LOCKS[key] = asyncio.Lock()
+    return lock
+
+
 def _overlay_text(*parts: str) -> str:
     """Join the lines of a title or overlay, each one safe to put in a URL.
 
@@ -763,10 +788,12 @@ class DahuaClient:
         # Raysharp / Lorex JSON API session state
         self._raysharp_session: aiohttp.ClientSession | None = None
         self._raysharp_logged_in: bool = False
-        self._raysharp_lock = asyncio.Lock()
+        self._raysharp_key = (_device_key(self._address, port), username)
+        self._raysharp_lock = _raysharp_login_lock(*self._raysharp_key)
         self._raysharp_csrf: str | None = None
-        self._raysharp_digest_state: dict = {}
-        self._raysharp_blocked_until: float = 0.0
+        # Shared for the reason the CGI challenge is: four entries each taking
+        # their own 401 is four more chances to be counted as a failed attempt.
+        self._raysharp_digest_state = _digest_state(*self._raysharp_key)
         # True once /API/Web/Login has succeeded for this client.
         self.raysharp_mode: bool = False
 
@@ -796,20 +823,22 @@ class DahuaClient:
         """Hold off logging in again while the NVR has the account blocked.
 
         A refused login answers with block_remain_time, and the device counts
-        every attempt made during it. The coordinator polls every ten seconds,
-        so without this the account never leaves the block -- and the block is
-        host-wide, which is why RTSP starts answering 401 to Frigate too.
+        every attempt made during it, so polling through a block keeps the
+        account locked indefinitely -- including for RTSP, which is how a
+        wrongly signed login takes the camera streams down with it.
         """
         try:
             remaining = int(str((data.get("data") or {}).get("block_remain_time", 0)))
         except (AttributeError, TypeError, ValueError):
             remaining = 0
-        self._raysharp_blocked_until = time.monotonic() + max(remaining, 60)
+        _RAYSHARP_BLOCKS[self._raysharp_key] = time.monotonic() + max(
+            remaining, RAYSHARP_MIN_BLOCK_SECONDS
+        )
 
     async def async_login(self) -> bool:
         """Log in to Raysharp / Lorex NVR via Digest Auth (userhash) and store session + CSRF."""
         async with self._raysharp_lock:
-            blocked_for = self._raysharp_blocked_until - time.monotonic()
+            blocked_for = _RAYSHARP_BLOCKS.get(self._raysharp_key, 0.0) - time.monotonic()
             if blocked_for > 0:
                 raise RaysharpAuthError(
                     f"{self._address} refused these credentials; "
@@ -861,7 +890,7 @@ class DahuaClient:
                             f"Login to {self._address} failed: HTTP {response.status}: {text}"
                         )
                     if data.get("result") == "success":
-                        self._raysharp_blocked_until = 0.0
+                        _RAYSHARP_BLOCKS.pop(self._raysharp_key, None)
                         self._raysharp_csrf = (
                             response.headers.get("X-csrftoken") or self._raysharp_csrf
                         )
