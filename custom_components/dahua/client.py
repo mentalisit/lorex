@@ -897,26 +897,35 @@ class DahuaClient:
             return True
         raise RaysharpApiError(f"Failed to set MotionDetection: {response}")
 
-    def get_rtsp_stream_url(self, channel: int, subtype: int) -> str:
+    def get_rtsp_stream_url(self, channel: int | str, subtype: int) -> str:
         """
-        Returns the RTSP url for the supplied subtype (subtype is 0=Main stream, 1=Sub stream)
+        Returns the RTSP URL for Lorex/Raysharp NVR streaming.
+        Format: rtsp://[user:pass@]ip:port/rtsp/streaming?channel=A&subtype=B
+        A: 01(ch1), 02(ch2)..
+        B: 0(main stream), 1(sub stream)
         """
-        url = "rtsp://{0}:{1}@{2}:{3}/cam/realmonitor?channel={4}&subtype={5}".format(
-            quote(self._username, safe=''),
-            quote(self._password, safe=''),
-            self._address,
-            self._rtsp_port,
-            channel,
-            subtype,
-        )
-        if subtype == 3:
-            url = "rtsp://{0}:{1}@{2}".format(
-                self._username,
-                self._password,
-                self._address,
-            )
+        try:
+            if isinstance(channel, str):
+                cleaned = channel.upper().replace("CH", "").strip()
+                chn_num = int(cleaned)
+            else:
+                chn_num = int(channel)
+            if chn_num <= 0:
+                chn_num = 1
+        except (ValueError, TypeError):
+            chn_num = 1
 
-        return url
+        channel_str = f"{chn_num:02d}"
+        subtype_str = "0" if subtype == 0 else "1"
+
+        auth = ""
+        if self._username:
+            if self._password:
+                auth = f"{quote(self._username, safe='')}:{quote(self._password, safe='')}@"
+            else:
+                auth = f"{quote(self._username, safe='')}@"
+
+        return f"rtsp://{auth}{self._address}:{self._rtsp_port}/rtsp/streaming?channel={channel_str}&subtype={subtype_str}"
 
     async def async_get_snapshot(self, channel_number: int) -> bytes:
         """
