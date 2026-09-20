@@ -1087,11 +1087,8 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         self._supports_lighting_v2 = False
         self._supports_lighting_scheme_illuminator = False
 
-        # channel_number is not the channel_index. channel_number is the index + 1.
-        # So channel index 0 is channel number 1. Except for some older firmwares where channel
-        # and channel number are the same! We check for this in _async_update_data and adjust the
-        # channel number as needed.
-        self._channel_number = channel + 1
+        # channel_number for Lorex / Raysharp corresponds directly to the configured channel
+        self._channel_number = channel if channel > 0 else 1
 
         # This is the name for the device given by the user during setup
         self._name = name

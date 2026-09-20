@@ -324,8 +324,11 @@ class DahuaCamera(DahuaBaseEntity, Camera):
 
     async def async_camera_image(self, width: int | None = None, height: int | None = None):
         """Return a still image response from the camera."""
-        # Send the request to snap a picture and return raw jpg data
-        return await self._coordinator.client.async_get_snapshot(self._channel_number)
+        try:
+            return await self._coordinator.client.async_get_snapshot(self._channel_number)
+        except Exception as ex:
+            _LOGGER.debug("Snapshot failed for channel %s: %s", self._channel_number, ex)
+            return None
 
     @property
     def supported_features(self):
@@ -334,7 +337,9 @@ class DahuaCamera(DahuaBaseEntity, Camera):
 
     async def stream_source(self):
         """Return the RTSP stream source."""
-        return self._stream_source
+        return self._coordinator.client.get_rtsp_stream_url(
+            self._channel_number, self._stream_index
+        )
 
     @property
     def motion_detection_enabled(self):
