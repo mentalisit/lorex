@@ -1,6 +1,6 @@
 {
-  "domain": "dahua",
-  "name": "Dahua",
+  "domain": "lorex_raysharp",
+  "name": "Lorex Raysharp NVR Integration",
   "after_dependencies": [
     "tag"
   ],

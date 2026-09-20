@@ -2,11 +2,12 @@
 from homeassistant.core import HomeAssistant
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.const import EntityCategory
+from homeassistant.exceptions import HomeAssistantError
 from custom_components.dahua import DahuaDataUpdateCoordinator
 
 from .const import DOMAIN, DISARMING_ICON, MOTION_DETECTION_ICON, SIREN_ICON, BELL_ICON, PRIVACY_MODE_ICON
 from .entity import DahuaBaseEntity
-from .client import SIREN_TYPE
+from .client import SIREN_TYPE, RaysharpApiError, RaysharpAuthError
 
 
 async def async_setup_entry(hass: HomeAssistant, entry, async_add_devices):
@@ -50,7 +51,7 @@ async def async_setup_entry(hass: HomeAssistant, entry, async_add_devices):
 
 
 class DahuaMotionDetectionBinarySwitch(DahuaBaseEntity, SwitchEntity):
-    """dahua motion detection switch class. Used to enable or disable motion detection"""
+    """dahua / lorex motion detection switch class. Used to enable or disable motion detection"""
 
     # Configuration, not a control: this changes how the camera behaves rather
     # than doing something now, so it belongs in the device page's configuration
@@ -58,17 +59,39 @@ class DahuaMotionDetectionBinarySwitch(DahuaBaseEntity, SwitchEntity):
     # left alone -- that one is an action someone wants on a dashboard.
     _attr_entity_category = EntityCategory.CONFIG
 
+    def _get_channel_key(self) -> str:
+        """Format channel as CH1, CH2, etc."""
+        raw_channel = self._coordinator.get_channel()
+        if isinstance(raw_channel, int):
+            return f"CH{raw_channel if raw_channel > 0 else raw_channel + 1}"
+        if isinstance(raw_channel, str):
+            return raw_channel if raw_channel.upper().startswith("CH") else f"CH{raw_channel}"
+        return "CH1"
 
     async def async_turn_on(self, **kwargs):  # pylint: disable=unused-argument
         """Turn on/enable motion detection."""
-        channel = self._coordinator.get_channel()
-        await self._coordinator.client.enable_motion_detection(channel, True)
+        channel_key = self._get_channel_key()
+        try:
+            await self._coordinator.client.async_set_motion_detection(channel_key, True)
+        except (RaysharpApiError, RaysharpAuthError) as err:
+            raise HomeAssistantError(f"Failed to turn on motion detection for {channel_key}: {err}") from err
+        except Exception:
+            # Fallback to legacy coordinator client method
+            channel = self._coordinator.get_channel()
+            await self._coordinator.client.enable_motion_detection(channel, True)
         await self._coordinator.async_refresh()
 
     async def async_turn_off(self, **kwargs):  # pylint: disable=unused-argument
         """Turn off/disable motion detection."""
-        channel = self._coordinator.get_channel()
-        await self._coordinator.client.enable_motion_detection(channel, False)
+        channel_key = self._get_channel_key()
+        try:
+            await self._coordinator.client.async_set_motion_detection(channel_key, False)
+        except (RaysharpApiError, RaysharpAuthError) as err:
+            raise HomeAssistantError(f"Failed to turn off motion detection for {channel_key}: {err}") from err
+        except Exception:
+            # Fallback to legacy coordinator client method
+            channel = self._coordinator.get_channel()
+            await self._coordinator.client.enable_motion_detection(channel, False)
         await self._coordinator.async_refresh()
 
     @property

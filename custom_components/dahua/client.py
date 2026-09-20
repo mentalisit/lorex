@@ -17,6 +17,14 @@ _LOGGER: logging.Logger = logging.getLogger(__package__)
 
 TIMEOUT_SECONDS = 20
 
+
+class RaysharpAuthError(Exception):
+    """Exception raised on NVR authentication failure."""
+
+
+class RaysharpApiError(Exception):
+    """Exception raised on NVR API error."""
+
 # The event stream asks the device to heartbeat at this interval, so a socket
 # that has delivered nothing for a comfortable multiple of it has stalled.
 EVENT_STREAM_HEARTBEAT_SECONDS = 5
@@ -739,6 +747,155 @@ class DahuaClient:
         self.identity_derived_from_credentials = False
         protocol = "https" if use_https else "http"
         self._base = "{0}://{1}:{2}".format(protocol, self._address, port)
+
+        # Raysharp / Lorex JSON API session state
+        self._raysharp_session: aiohttp.ClientSession | None = None
+        self._raysharp_logged_in: bool = False
+        self._raysharp_lock = asyncio.Lock()
+
+    def _get_raysharp_session(self) -> aiohttp.ClientSession:
+        """Returns or creates an aiohttp.ClientSession with CookieJar for Raysharp API."""
+        if self._raysharp_session is None or self._raysharp_session.closed:
+            cookie_jar = aiohttp.CookieJar(unsafe=True)
+            self._raysharp_session = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(ssl=False),
+                cookie_jar=cookie_jar,
+            )
+        return self._raysharp_session
+
+    @property
+    def login_url(self) -> str:
+        """URL for Raysharp login with Basic Auth credentials in the URL."""
+        encoded_user = quote(self._username, safe="")
+        encoded_pass = quote(self._password, safe="")
+        protocol = "https" if self._use_https else "http"
+        return f"{protocol}://{encoded_user}:{encoded_pass}@{self._address}:{self._port}/API/Web/Login"
+
+    async def async_login(self) -> bool:
+        """Log in to Raysharp / Lorex NVR and store session cookies."""
+        async with self._raysharp_lock:
+            session = self._get_raysharp_session()
+            login_payload = {
+                "data": {
+                    "support_new_schedule": True,
+                    "remote_terminal_info": "WEB,chrome",
+                }
+            }
+            _LOGGER.debug("Attempting Raysharp login to %s", self._address)
+            try:
+                async with session.post(
+                    self.login_url,
+                    json=login_payload,
+                    timeout=aiohttp.ClientTimeout(total=TIMEOUT_SECONDS),
+                ) as response:
+                    if response.status == 401:
+                        self._raysharp_logged_in = False
+                        raise RaysharpAuthError("Invalid credentials for NVR login (HTTP 401)")
+
+                    response.raise_for_status()
+                    data = await response.json(content_type=None)
+                    if isinstance(data, dict) and data.get("result") == "success":
+                        self._raysharp_logged_in = True
+                        _LOGGER.info("Successfully logged in to Raysharp NVR (%s)", self._address)
+                        return True
+
+                    self._raysharp_logged_in = False
+                    raise RaysharpAuthError(f"Raysharp login rejected: {data}")
+            except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+                self._raysharp_logged_in = False
+                _LOGGER.error("Network error during login to %s: %s", self._address, err)
+                raise RaysharpApiError(f"Could not connect to NVR: {err}") from err
+
+    async def async_post_json(
+        self,
+        endpoint: str,
+        payload: dict,
+        retry_on_auth_fail: bool = True,
+    ) -> dict:
+        """Post JSON payload to Raysharp NVR endpoint with automatic re-auth."""
+        if not self._raysharp_logged_in:
+            await self.async_login()
+
+        url = f"{self._base}{endpoint}"
+        session = self._get_raysharp_session()
+
+        try:
+            async with session.post(
+                url,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=TIMEOUT_SECONDS),
+            ) as response:
+                if response.status == 401 and retry_on_auth_fail:
+                    _LOGGER.warning("Raysharp session expired (HTTP 401), re-authenticating...")
+                    self._raysharp_logged_in = False
+                    await self.async_login()
+                    return await self.async_post_json(endpoint, payload, retry_on_auth_fail=False)
+
+                response.raise_for_status()
+                data = await response.json(content_type=None)
+
+                if (
+                    isinstance(data, dict)
+                    and data.get("result") in ("session_timeout", "auth_failed", "unauthorized")
+                    and retry_on_auth_fail
+                ):
+                    _LOGGER.warning("Raysharp session timed out (%s), re-authenticating...", data.get("result"))
+                    self._raysharp_logged_in = False
+                    await self.async_login()
+                    return await self.async_post_json(endpoint, payload, retry_on_auth_fail=False)
+
+                return data
+        except aiohttp.ClientResponseError as err:
+            if err.status == 401 and retry_on_auth_fail:
+                self._raysharp_logged_in = False
+                await self.async_login()
+                return await self.async_post_json(endpoint, payload, retry_on_auth_fail=False)
+            raise RaysharpApiError(f"HTTP error {err.status} for {endpoint}: {err}") from err
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            raise RaysharpApiError(f"Network error accessing {endpoint}: {err}") from err
+
+    async def async_set_motion_detection(self, channel_id: int | str, enabled: bool) -> bool:
+        """Enable or disable motion detection on Lorex/Raysharp NVR for the given channel."""
+        if isinstance(channel_id, int):
+            chn_key = f"CH{channel_id if channel_id > 0 else channel_id + 1}"
+        elif isinstance(channel_id, str):
+            chn_key = channel_id if channel_id.upper().startswith("CH") else f"CH{channel_id}"
+        else:
+            chn_key = "CH1"
+
+        state_str = "On" if enabled else "Off"
+        payload = {
+            "version": "1.0",
+            "data": {
+                "channel_info": {
+                    chn_key: {
+                        "abilities": [
+                            {
+                                "ability_info": [
+                                    {
+                                        "ability": "MotionDetection",
+                                        "state": state_str,
+                                        "pages": [
+                                            {"title": "Settings", "page": "smart_setting"},
+                                            {"title": "Detection Schedule", "page": "smart_plan"},
+                                            {"title": "Alarm Linkage", "page": "smart_alarm_linkage"},
+                                        ],
+                                        "mutual_ability": [{"channel": chn_key, "ability": []}],
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }
+            },
+        }
+
+        endpoint = "/API/Event/ChnSmart/Set"
+        _LOGGER.debug("Setting MotionDetection for %s -> %s", chn_key, state_str)
+        response = await self.async_post_json(endpoint, payload)
+        if isinstance(response, dict) and response.get("result") == "success":
+            return True
+        raise RaysharpApiError(f"Failed to set MotionDetection: {response}")
 
     def get_rtsp_stream_url(self, channel: int, subtype: int) -> str:
         """
@@ -1869,10 +2026,16 @@ class DahuaClient:
         url = "/cgi-bin/accessControl.cgi?action=openDoor&UserID=101&Type=Remote&channel={0}".format(door_id)
         return await self.get(url)
 
-    async def enable_motion_detection(self, channel: int, enabled: bool) -> dict:
+    async def enable_motion_detection(self, channel: int | str, enabled: bool) -> dict | bool:
         """
-        enable_motion_detection will either enable/disable motion detection on the camera depending on the value
+        enable_motion_detection enables or disables motion detection for the given channel.
+        Uses Raysharp JSON API first, falling back to Dahua CGI if needed.
         """
+        try:
+            return await self.async_set_motion_detection(channel, enabled)
+        except Exception as err:
+            _LOGGER.debug("Raysharp MotionDetection failed, trying Dahua CGI fallback: %s", err)
+
         url = "/cgi-bin/configManager.cgi?action=setConfig&MotionDetect[{channel}].Enable={enabled}&MotionDetect[{channel}].DetectVersion=V3.0".format(
             channel=channel, enabled=str(enabled).lower())
         response = await self.get(url)

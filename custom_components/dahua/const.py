@@ -1,7 +1,7 @@
 """Constants for Dahua."""
 # Base component constants
-NAME = "Dahua"
-DOMAIN = "dahua"
+NAME = "Lorex Raysharp NVR Integration"
+DOMAIN = "lorex_raysharp"
 DOMAIN_DATA = f"{DOMAIN}_data"
 ATTRIBUTION = "Data provided by https://ronnieroller.com"
 ISSUE_URL = "https://github.com/rroller/dahua/issues"
