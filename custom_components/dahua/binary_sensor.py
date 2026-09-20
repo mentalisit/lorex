@@ -4,7 +4,7 @@ import re
 from homeassistant.components.binary_sensor import BinarySensorEntity, BinarySensorDeviceClass
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import async_call_later
-from custom_components.dahua import DahuaDataUpdateCoordinator
+from . import DahuaDataUpdateCoordinator
 
 from .const import (
     MOTION_SENSOR_DEVICE_CLASS,

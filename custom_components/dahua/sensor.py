@@ -10,7 +10,7 @@ from homeassistant.components.sensor import SensorEntity
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 
-from custom_components.dahua import DahuaDataUpdateCoordinator
+from . import DahuaDataUpdateCoordinator
 
 from .const import DOMAIN
 from .entity import DahuaBaseEntity, DahuaEventDrivenEntity

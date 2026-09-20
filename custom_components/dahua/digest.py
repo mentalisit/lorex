@@ -154,12 +154,15 @@ class DigestAuth:
         # refuse that, and 403 is what refusing it looks like.
         path = URL(url).raw_path_qs
 
-        # RFC 7616 userhash=true (Lorex / Raysharp OpenResty): the username
-        # used in A1 and in the Authorization header is H(username:realm).
+        # RFC 7616 userhash=true (Lorex / Raysharp OpenResty): only the username
+        # carried in the Authorization header is hashed, so the server can look
+        # the account up without the name crossing the wire. A1 keeps the plain
+        # username -- hashing it there produces a response the device reads as a
+        # wrong password, and a few of those lock the account out for 180s.
         use_userhash = str(self.challenge.get("userhash", "")).lower() == "true"
         auth_username = H("%s:%s" % (self.username, realm)) if use_userhash else self.username
 
-        A1 = "%s:%s:%s" % (auth_username, realm, self.password)
+        A1 = "%s:%s:%s" % (self.username, realm, self.password)
         A2 = "%s:%s" % (method, path)
 
         HA1 = H(A1)

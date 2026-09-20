@@ -672,6 +672,17 @@ def parse_extra_streams(value) -> int:
     return count
 
 
+def rtsp_userinfo(value: str) -> str:
+    """Escape a username or password for the userinfo part of an RTSP URL.
+
+    ffmpeg's RTSP demuxer splits the userinfo off the URL and uses it verbatim
+    in the Digest/Basic response, without percent-decoding it. Encoding the
+    whole value therefore signs the escaped text and the device answers 401.
+    Only the delimiters that would break the split are escaped.
+    """
+    return quote(value, safe="!$&'()*+,;=-._~")
+
+
 def _is_login_refused(exception: aiohttp.ClientResponseError) -> bool:
     """True when the device refused the credentials, not the endpoint.
 
@@ -755,6 +766,7 @@ class DahuaClient:
         self._raysharp_lock = asyncio.Lock()
         self._raysharp_csrf: str | None = None
         self._raysharp_digest_state: dict = {}
+        self._raysharp_blocked_until: float = 0.0
         # True once /API/Web/Login has succeeded for this client.
         self.raysharp_mode: bool = False
 
@@ -780,15 +792,36 @@ class DahuaClient:
             headers["X-csrftoken"] = self._raysharp_csrf
         return headers
 
+    def _raysharp_note_refusal(self, data: dict) -> None:
+        """Hold off logging in again while the NVR has the account blocked.
+
+        A refused login answers with block_remain_time, and the device counts
+        every attempt made during it. The coordinator polls every ten seconds,
+        so without this the account never leaves the block -- and the block is
+        host-wide, which is why RTSP starts answering 401 to Frigate too.
+        """
+        try:
+            remaining = int(str((data.get("data") or {}).get("block_remain_time", 0)))
+        except (AttributeError, TypeError, ValueError):
+            remaining = 0
+        self._raysharp_blocked_until = time.monotonic() + max(remaining, 60)
+
     async def async_login(self) -> bool:
         """Log in to Raysharp / Lorex NVR via Digest Auth (userhash) and store session + CSRF."""
         async with self._raysharp_lock:
+            blocked_for = self._raysharp_blocked_until - time.monotonic()
+            if blocked_for > 0:
+                raise RaysharpAuthError(
+                    f"{self._address} refused these credentials; "
+                    f"not retrying for {int(blocked_for)}s"
+                )
             session = self._get_raysharp_session()
             login_payload = {
+                "version": "1.0",
                 "data": {
                     "support_new_schedule": True,
                     "remote_terminal_info": "WEB,chrome",
-                }
+                },
             }
             _LOGGER.debug("Attempting Raysharp Digest login to %s", self._address)
             try:
@@ -807,9 +840,28 @@ class DahuaClient:
                         self.raysharp_mode = False
                         raise RaysharpAuthError("Invalid credentials for NVR login (HTTP 401)")
 
-                    response.raise_for_status()
-                    data = await response.json(content_type=None)
-                    if isinstance(data, dict) and data.get("result") == "success":
+                    text = await response.text()
+                    try:
+                        data = json.loads(text) if text else {}
+                    except json.JSONDecodeError:
+                        data = {"raw": text}
+                    if not isinstance(data, dict):
+                        data = {"raw": data}
+
+                    if data.get("error_code") == "verify_failed":
+                        self._raysharp_logged_in = False
+                        self._raysharp_note_refusal(data)
+                        raise RaysharpAuthError(
+                            f"{self._address} rejected the credentials: "
+                            f"{data.get('reason', text)}"
+                        )
+
+                    if response.status >= 400:
+                        raise RaysharpApiError(
+                            f"Login to {self._address} failed: HTTP {response.status}: {text}"
+                        )
+                    if data.get("result") == "success":
+                        self._raysharp_blocked_until = 0.0
                         self._raysharp_csrf = (
                             response.headers.get("X-csrftoken") or self._raysharp_csrf
                         )
@@ -1008,9 +1060,9 @@ class DahuaClient:
         auth = ""
         if self._username:
             if self._password:
-                auth = f"{quote(self._username, safe='')}:{quote(self._password, safe='')}@"
+                auth = f"{rtsp_userinfo(self._username)}:{rtsp_userinfo(self._password)}@"
             else:
-                auth = f"{quote(self._username, safe='')}@"
+                auth = f"{rtsp_userinfo(self._username)}@"
 
         return (
             f"rtsp://{auth}{self._address}:{self._rtsp_port}"

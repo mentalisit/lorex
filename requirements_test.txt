@@ -1,3 +1,4 @@
 pytest-homeassistant-custom-component==0.13.286
 pycares>=4.0.0,<5.0.0
 PyTurboJPEG
+ha-ffmpeg==3.2.2
