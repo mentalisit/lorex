@@ -766,6 +766,7 @@ class DahuaClient:
         self._raysharp_lock = asyncio.Lock()
         self._raysharp_csrf: str | None = None
         self._raysharp_digest_state: dict = {}
+        self._raysharp_blocked_until: float = 0.0
         # True once /API/Web/Login has succeeded for this client.
         self.raysharp_mode: bool = False
 
@@ -791,9 +792,29 @@ class DahuaClient:
             headers["X-csrftoken"] = self._raysharp_csrf
         return headers
 
+    def _raysharp_note_refusal(self, data: dict) -> None:
+        """Hold off logging in again while the NVR has the account blocked.
+
+        A refused login answers with block_remain_time, and the device counts
+        every attempt made during it. The coordinator polls every ten seconds,
+        so without this the account never leaves the block -- and the block is
+        host-wide, which is why RTSP starts answering 401 to Frigate too.
+        """
+        try:
+            remaining = int(str((data.get("data") or {}).get("block_remain_time", 0)))
+        except (AttributeError, TypeError, ValueError):
+            remaining = 0
+        self._raysharp_blocked_until = time.monotonic() + max(remaining, 60)
+
     async def async_login(self) -> bool:
         """Log in to Raysharp / Lorex NVR via Digest Auth (userhash) and store session + CSRF."""
         async with self._raysharp_lock:
+            blocked_for = self._raysharp_blocked_until - time.monotonic()
+            if blocked_for > 0:
+                raise RaysharpAuthError(
+                    f"{self._address} refused these credentials; "
+                    f"not retrying for {int(blocked_for)}s"
+                )
             session = self._get_raysharp_session()
             login_payload = {
                 "version": "1.0",
@@ -820,15 +841,27 @@ class DahuaClient:
                         raise RaysharpAuthError("Invalid credentials for NVR login (HTTP 401)")
 
                     text = await response.text()
-                    if response.status >= 400:
-                        raise RaysharpApiError(
-                            f"Login to {self._address} failed: HTTP {response.status}: {text}"
-                        )
                     try:
                         data = json.loads(text) if text else {}
                     except json.JSONDecodeError:
                         data = {"raw": text}
-                    if isinstance(data, dict) and data.get("result") == "success":
+                    if not isinstance(data, dict):
+                        data = {"raw": data}
+
+                    if data.get("error_code") == "verify_failed":
+                        self._raysharp_logged_in = False
+                        self._raysharp_note_refusal(data)
+                        raise RaysharpAuthError(
+                            f"{self._address} rejected the credentials: "
+                            f"{data.get('reason', text)}"
+                        )
+
+                    if response.status >= 400:
+                        raise RaysharpApiError(
+                            f"Login to {self._address} failed: HTTP {response.status}: {text}"
+                        )
+                    if data.get("result") == "success":
+                        self._raysharp_blocked_until = 0.0
                         self._raysharp_csrf = (
                             response.headers.get("X-csrftoken") or self._raysharp_csrf
                         )
