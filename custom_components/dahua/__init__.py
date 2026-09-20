@@ -24,7 +24,7 @@ from homeassistant.helpers.typing import ConfigType
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 
 from . import dahua_utils
-from .client import DahuaClient, clear_host_cache
+from .client import DahuaClient, RaysharpApiError, RaysharpAuthError, clear_host_cache
 from .model_profiles import is_sdt4e425
 
 from .const import (
@@ -1115,6 +1115,15 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
 
         self._floodlight_mode = 2
 
+        # Lorex / Raysharp NVR live state (from Event/Check + ChnSmart)
+        self._raysharp = False
+        self._raysharp_channel_abilities: list[str] = []
+        self._raysharp_motion_enabled = True
+        self._raysharp_floodlight_on = False
+        self._raysharp_audio_alarm_on = False
+        self._raysharp_motion_alarm = False
+        self._raysharp_channel_name = ""
+
         self._last_plate_data: dict = {}
         self._last_plate_timestamp: int = 0
         self._plate_listeners: list = []
@@ -1247,6 +1256,106 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         """
         return any(self.config_entry.options.get(platform, True) for platform in platforms)
 
+    def _raysharp_ch_key(self) -> str:
+        return f"CH{self._channel_number}"
+
+    async def _async_init_raysharp(self, data: dict) -> None:
+        """One-time setup for Lorex/Raysharp JSON API devices (no Dahua CGI)."""
+        self._raysharp = True
+        self.client.raysharp_mode = True
+        # Deterrence entities use the NVR coaxial branch, which now routes to
+        # Floodlight2AudioAlarm on Raysharp.
+        self._nvr_active_deterrence = True
+        self._supports_coaxial_control = True
+        self._max_streams = 2
+
+        device_type = data.get("deviceType") or data.get("model") or "Lorex NVR"
+        data["model"] = device_type
+        self.model = device_type
+        self.machine_name = (
+            data.get("table.General.MachineName")
+            or data.get("machineName")
+            or device_type
+        )
+        self._serial_number = data.get("serialNumber") or ""
+        self._firmware_version = data.get("softwareVersion") or data.get("version") or ""
+
+        try:
+            ch_info = await self.client.async_get_channel_info()
+            for item in ch_info.get("channel_param", {}).get("items") or []:
+                if item.get("channel") == self._raysharp_ch_key():
+                    self._raysharp_channel_abilities = list(item.get("ability") or [])
+                    self._raysharp_channel_name = item.get("channel_name") or ""
+                    break
+            # Enrich from IPChannel if available
+            try:
+                ip_resp = await self.client.async_post_json("/API/ChannelConfig/IPChannel/Get")
+                ip_data = (ip_resp or {}).get("data", {}).get("channel_info", {})
+                ch = ip_data.get(self._raysharp_ch_key()) or {}
+                if ch.get("device_type"):
+                    self._channel_model = ch.get("device_type")
+                if ch.get("channel_name"):
+                    self._raysharp_channel_name = ch.get("channel_name")
+            except Exception:  # pylint: disable=broad-except
+                pass
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.warning("Raysharp ChannelInfo failed: %s", err)
+
+        _LOGGER.info(
+            "Raysharp NVR channel %s abilities=%s name=%s model=%s",
+            self._raysharp_ch_key(),
+            self._raysharp_channel_abilities,
+            self._raysharp_channel_name,
+            self.model,
+        )
+        self.initialized = True
+
+    async def _async_update_raysharp(self, data: dict) -> dict:
+        """Poll Event/Check + ChnSmart for this Raysharp channel."""
+        ch_key = self._raysharp_ch_key()
+        try:
+            events = await self.client.async_event_check()
+            for block in events.get("alarm_list") or []:
+                for ch in block.get("channel_alarm") or []:
+                    if ch.get("channel") != ch_key:
+                        continue
+                    fa = ch.get("Floodlight_AudioAlarm") or {}
+                    self._raysharp_floodlight_on = bool(fa.get("floodlight_switch"))
+                    self._raysharp_audio_alarm_on = bool(fa.get("audioAlarm_switch"))
+                    self._raysharp_motion_alarm = bool(ch.get("motion_alarm"))
+                    if ch.get("channel_name"):
+                        self._raysharp_channel_name = ch.get("channel_name")
+                    # Publish motion like the event stream would.
+                    event_key = self.get_event_key("VideoMotion")
+                    if self._raysharp_motion_alarm:
+                        self._dahua_event_timestamp[event_key] = int(time.time())
+                    else:
+                        self._dahua_event_timestamp[event_key] = 0
+                    break
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.debug("Raysharp Event/Check failed: %s", err)
+
+        try:
+            smart = await self.client.async_get_chn_smart()
+            ch = (smart.get("channel_info") or {}).get(ch_key) or {}
+            enabled = True
+            for group in ch.get("abilities") or []:
+                for info in group.get("ability_info") or []:
+                    if info.get("ability") == "MotionDetection":
+                        enabled = str(info.get("state", "On")).lower() in ("on", "true", "1")
+            self._raysharp_motion_enabled = enabled
+            # Keep Dahua-shaped key so existing getters keep working.
+            data[f"table.MotionDetect[{self._channel}].Enable"] = (
+                "true" if enabled else "false"
+            )
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.debug("Raysharp ChnSmart failed: %s", err)
+
+        data["raysharp"] = True
+        data["raysharp_floodlight"] = self._raysharp_floodlight_on
+        data["raysharp_audio_alarm"] = self._raysharp_audio_alarm_on
+        return data
+
     async def _async_update_data(self):
         """Reload the camera information"""
         data = {}
@@ -1254,193 +1363,210 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         # Do the one time initialization (do this when Home Assistant starts)
         if not self.initialized:
             try:
-                # Find the max number of streams. 1 main stream + n number of sub-streams
-                self._max_streams = await self.client.get_max_extra_streams() + 1
-                _LOGGER.debug("Using max streams %s", self._max_streams)
+                # Prefer Raysharp JSON API (Lorex RN101A / OpenResty). When it
+                # answers, skip the Dahua CGI capability probes entirely.
+                try:
+                    await self.client.async_login()
+                    if self.client.raysharp_mode:
+                        machine_name = await self.client.get_machine_name()
+                        sys_info = await self.client.async_get_system_info()
+                        version = await self.client.get_software_version()
+                        data.update(machine_name)
+                        data.update(sys_info)
+                        data.update(version)
+                        await self._async_init_raysharp(data)
+                except (RaysharpAuthError, RaysharpApiError) as err:
+                    _LOGGER.debug("Not a Raysharp device or login failed: %s", err)
+                    self.client.raysharp_mode = False
 
-                machine_name = await self.client.async_get_machine_name()
-                sys_info = await self.client.async_get_system_info()
-                version = await self.client.get_software_version()
-                data.update(machine_name)
-                data.update(sys_info)
-                data.update(version)
+                if not self.initialized:
+                    # Find the max number of streams. 1 main stream + n number of sub-streams
+                    self._max_streams = await self.client.get_max_extra_streams() + 1
+                    _LOGGER.debug("Using max streams %s", self._max_streams)
 
-                device_type = data.get("deviceType", None)
-                # Kept so the chain below can fall back to it: it is generic,
-                # but it beats the None a failed lookup would otherwise leave.
-                reported_type = device_type
-                # Lorex NVRs return deviceType=31, but the model is in the updateSerial
-                # /cgi-bin/magicBox.cgi?action=getSystemInfo"
-                # deviceType=31
-                # processor=ST7108
-                # serialNumber=ND0219110NNNNN
-                # updateSerial=DHI-NVR4108HS-8P-4KS2
-                if device_type in ["IP Camera", "31"] or device_type is None:
-                    # Some firmwares put the device type in the "updateSerial" field. Weird.
-                    device_type = data.get("updateSerial", None)
-                    if device_type is None:
-                        # If it's still none, then call the device type API
-                        dt = await self.client.get_device_type()
-                        device_type = dt.get("type")
-                device_type = model_name(device_type, reported_type)
-                data["model"] = device_type
-                self.model = device_type
-                self.machine_name = data.get("table.General.MachineName")
-                self._serial_number = data.get("serialNumber")
-                self._firmware_version = data.get("version") or ""
+                    machine_name = await self.client.async_get_machine_name()
+                    sys_info = await self.client.async_get_system_info()
+                    version = await self.client.get_software_version()
+                    data.update(machine_name)
+                    data.update(sys_info)
+                    data.update(version)
 
-                # Some Dahua firmwares index channels from 0, others from 1. The default
-                # is to auto-detect: if a snapshot at index 0 succeeds, treat this camera as
-                # 0-indexed and reset channel_number accordingly. Users on cameras where this
-                # heuristic gets it wrong (HTTP snapshot at 0 succeeds but RTSP only streams
-                # on channel=1) can disable it via the integration options.
-                auto_detect = self.config_entry.options.get(CONF_AUTO_DETECT_CHANNEL, True)
-                if auto_detect:
+                    device_type = data.get("deviceType", None)
+                    # Kept so the chain below can fall back to it: it is generic,
+                    # but it beats the None a failed lookup would otherwise leave.
+                    reported_type = device_type
+                    # Lorex NVRs return deviceType=31, but the model is in the updateSerial
+                    # /cgi-bin/magicBox.cgi?action=getSystemInfo"
+                    # deviceType=31
+                    # processor=ST7108
+                    # serialNumber=ND0219110NNNNN
+                    # updateSerial=DHI-NVR4108HS-8P-4KS2
+                    if device_type in ["IP Camera", "31"] or device_type is None:
+                        # Some firmwares put the device type in the "updateSerial" field. Weird.
+                        device_type = data.get("updateSerial", None)
+                        if device_type is None:
+                            # If it's still none, then call the device type API
+                            dt = await self.client.get_device_type()
+                            device_type = dt.get("type")
+                    device_type = model_name(device_type, reported_type)
+                    data["model"] = device_type
+                    self.model = device_type
+                    self.machine_name = data.get("table.General.MachineName")
+                    self._serial_number = data.get("serialNumber")
+                    self._firmware_version = data.get("version") or ""
+
+                    # Some Dahua firmwares index channels from 0, others from 1. The default
+                    # is to auto-detect: if a snapshot at index 0 succeeds, treat this camera as
+                    # 0-indexed and reset channel_number accordingly. Users on cameras where this
+                    # heuristic gets it wrong (HTTP snapshot at 0 succeeds but RTSP only streams
+                    # on channel=1) can disable it via the integration options.
+                    auto_detect = self.config_entry.options.get(CONF_AUTO_DETECT_CHANNEL, True)
+                    if auto_detect:
+                        try:
+                            await self.client.async_probe_snapshot(0)
+                            # If able to take a snapshot with index 0 then most likely this cams channel needs to be reset
+                            # but check if unit is not a doorbell first as channel 0 doesnt exist for VTOs
+                            if not self.is_doorbell():
+                                self._channel_number = self._channel
+                        except PROBE_FAILED:
+                            pass
+                    _LOGGER.debug("Using channel number %s (auto_detect=%s)", self._channel_number, auto_detect)
+
                     try:
-                        await self.client.async_probe_snapshot(0)
-                        # If able to take a snapshot with index 0 then most likely this cams channel needs to be reset
-                        # but check if unit is not a doorbell first as channel 0 doesnt exist for VTOs
-                        if not self.is_doorbell():
-                            self._channel_number = self._channel
+                        coaxial_channel = self._channel_number if self.is_nvr_channel() else 1
+                        await self.client.async_get_coaxial_control_io_status(coaxial_channel)
+                        self._supports_coaxial_control = True
+                    except PROBE_REFUSED:
+                        self._supports_coaxial_control = False
+                    _LOGGER.debug("Device supports Coaxial Control=%s", self._supports_coaxial_control)
+
+                    try:
+                        alarm_output_data = await self.client.async_get_alarm_output_slots()
+                        try:
+                            self._alarm_output_slots = max(0, int(alarm_output_data.get("result", "0")))
+                        except (ValueError, TypeError):
+                            self._alarm_output_slots = 0
                     except PROBE_FAILED:
-                        pass
-                _LOGGER.debug("Using channel number %s (auto_detect=%s)", self._channel_number, auto_detect)
-
-                try:
-                    coaxial_channel = self._channel_number if self.is_nvr_channel() else 1
-                    await self.client.async_get_coaxial_control_io_status(coaxial_channel)
-                    self._supports_coaxial_control = True
-                except PROBE_REFUSED:
-                    self._supports_coaxial_control = False
-                _LOGGER.debug("Device supports Coaxial Control=%s", self._supports_coaxial_control)
-
-                try:
-                    alarm_output_data = await self.client.async_get_alarm_output_slots()
-                    try:
-                        self._alarm_output_slots = max(0, int(alarm_output_data.get("result", "0")))
-                    except (ValueError, TypeError):
                         self._alarm_output_slots = 0
-                except PROBE_FAILED:
-                    self._alarm_output_slots = 0
-                _LOGGER.debug("Device alarm output slots=%s", self._alarm_output_slots)
-                if self._alarm_output_slots > 1:
-                    _LOGGER.debug(
-                        "Device reports %s alarm outputs; entities are not created because "
-                        "the multi-output getOutState encoding is not yet verified",
-                        self._alarm_output_slots,
-                    )
+                    _LOGGER.debug("Device alarm output slots=%s", self._alarm_output_slots)
+                    if self._alarm_output_slots > 1:
+                        _LOGGER.debug(
+                            "Device reports %s alarm outputs; entities are not created because "
+                            "the multi-output getOutState encoding is not yet verified",
+                            self._alarm_output_slots,
+                        )
 
-                try:
-                    await self.client.async_get_disarming_linkage()
-                    self._supports_disarming_linkage = True
-                except PROBE_FAILED:
-                    self._supports_disarming_linkage = False
-                _LOGGER.debug("Device supports disarming linkage=%s", self._supports_disarming_linkage)
-
-                try:
-                    await self.client.async_get_event_notifications()
-                    self._supports_event_notifications = True
-                except PROBE_FAILED:
-                    self._supports_event_notifications = False
-                _LOGGER.debug("Device supports event notifications=%s", self._supports_event_notifications)
-
-                # PTZ position readback. The SDT4E425 PTZ sensor is controllable,
-                # but firmware V3.200.0000027.6.R returns HTTP 400 for CGI getStatus.
-                # Do not conflate PTZ/preset control with CGI position readback.
-                if is_sdt4e425(self.model):
-                    self._supports_ptz_position = False
-                else:
                     try:
-                        await self.client.async_get_ptz_position()
-                        self._supports_ptz_position = True
+                        await self.client.async_get_disarming_linkage()
+                        self._supports_disarming_linkage = True
                     except PROBE_FAILED:
+                        self._supports_disarming_linkage = False
+                    _LOGGER.debug("Device supports disarming linkage=%s", self._supports_disarming_linkage)
+
+                    try:
+                        await self.client.async_get_event_notifications()
+                        self._supports_event_notifications = True
+                    except PROBE_FAILED:
+                        self._supports_event_notifications = False
+                    _LOGGER.debug("Device supports event notifications=%s", self._supports_event_notifications)
+
+                    # PTZ position readback. The SDT4E425 PTZ sensor is controllable,
+                    # but firmware V3.200.0000027.6.R returns HTTP 400 for CGI getStatus.
+                    # Do not conflate PTZ/preset control with CGI position readback.
+                    if is_sdt4e425(self.model):
                         self._supports_ptz_position = False
-                _LOGGER.debug("Device supports PTZ position=%s", self._supports_ptz_position)
+                    else:
+                        try:
+                            await self.client.async_get_ptz_position()
+                            self._supports_ptz_position = True
+                        except PROBE_FAILED:
+                            self._supports_ptz_position = False
+                    _LOGGER.debug("Device supports PTZ position=%s", self._supports_ptz_position)
 
-                # Smart motion detection is enabled/disabled/fetched differently on Dahua devices compared to Amcrest
-                # The following lines are for Dahua devices
-                smart_motion_rows = None
-                try:
-                    table = await self.client.async_get_smart_motion_detection()
-                    self._supports_smart_motion_detection = True
-                    smart_motion_rows = smart_motion_row_indices(table)
-                except PROBE_FAILED:
-                    self._supports_smart_motion_detection = False
-                _LOGGER.debug("Device supports smart motion detection=%s", self._supports_smart_motion_detection)
+                    # Smart motion detection is enabled/disabled/fetched differently on Dahua devices compared to Amcrest
+                    # The following lines are for Dahua devices
+                    smart_motion_rows = None
+                    try:
+                        table = await self.client.async_get_smart_motion_detection()
+                        self._supports_smart_motion_detection = True
+                        smart_motion_rows = smart_motion_row_indices(table)
+                    except PROBE_FAILED:
+                        self._supports_smart_motion_detection = False
+                    _LOGGER.debug("Device supports smart motion detection=%s", self._supports_smart_motion_detection)
 
-                # Day/Night mode. Judged by whether this channel's row came
-                # back, not by whether the request raised: async_get_config
-                # swallows a ClientResponseError and returns {}, and a device
-                # can answer 200 with an empty body for a table it lacks.
-                try:
-                    options = await self.client.async_get_video_in_options()
-                    self._supports_day_night_color = (
-                        day_night_color_name(options, self._channel) is not None)
-                except PROBE_FAILED:
-                    self._supports_day_night_color = False
-                _LOGGER.debug("Device supports day/night mode=%s", self._supports_day_night_color)
+                    # Day/Night mode. Judged by whether this channel's row came
+                    # back, not by whether the request raised: async_get_config
+                    # swallows a ClientResponseError and returns {}, and a device
+                    # can answer 200 with an empty body for a table it lacks.
+                    try:
+                        options = await self.client.async_get_video_in_options()
+                        self._supports_day_night_color = (
+                            day_night_color_name(options, self._channel) is not None)
+                    except PROBE_FAILED:
+                        self._supports_day_night_color = False
+                    _LOGGER.debug("Device supports day/night mode=%s", self._supports_day_night_color)
 
-                # Which camera is actually on this channel. Every channel of a
-                # recorder reports the recorder's model, so a doorbell behind an
-                # NVR is invisible as one and every model-string capability
-                # check sees the wrong device. Read once at setup: RemoteDevice
-                # is large and never changes between reboots, and the shared read
-                # cache answers it once for all of a recorder's channels.
-                try:
-                    remote = await self.client.async_get_config("RemoteDevice")
-                    self._channel_model = remote_device_model(remote, self._channel)
-                    if is_onvif_channel(remote, self._channel):
-                        # Say it once, plainly, instead of leaving a camera
-                        # entity that answers 400 for the life of the entry.
-                        _LOGGER.warning(
-                            "Channel %s of %s is attached to the recorder over ONVIF, "
-                            "not Dahua's own protocol. A recorder does not serve such a "
-                            "channel on its Dahua paths -- measured on a "
-                            "DHI-NVR5464-16P-EI, snapshot.cgi answers 400 for the ONVIF "
-                            "channel while every Dahua-protocol channel on the same "
-                            "recorder returns an image -- so video for this camera will "
-                            "not work here whatever channel number is used. Home "
-                            "Assistant's own ONVIF integration, pointed at the recorder "
-                            "rather than at the camera, does serve it (#646).",
-                            self._channel, self._address)
-                except PROBE_FAILED:
-                    self._channel_model = None
-                if self._channel_model:
-                    _LOGGER.debug(
-                        "Channel %s carries a %s; the device itself reports %s",
-                        self._channel, self._channel_model, self.model)
-                if self._supports_smart_motion_detection:
-                    # Which rows the device reports is the whole capability
-                    # decision for this channel (#635), and nothing logged it.
-                    # #669 spent two rounds of guessing for want of this line,
-                    # because a response body is never logged at debug.
-                    _LOGGER.debug(
-                        "SmartMotionDetect rows reported: %s; this channel is %s, so its "
-                        "switch is %s",
-                        smart_motion_rows if smart_motion_rows else "none",
-                        self._channel,
-                        "created" if self._channel in (smart_motion_rows or ()) else "not created",
-                    )
+                    # Which camera is actually on this channel. Every channel of a
+                    # recorder reports the recorder's model, so a doorbell behind an
+                    # NVR is invisible as one and every model-string capability
+                    # check sees the wrong device. Read once at setup: RemoteDevice
+                    # is large and never changes between reboots, and the shared read
+                    # cache answers it once for all of a recorder's channels.
+                    try:
+                        remote = await self.client.async_get_config("RemoteDevice")
+                        self._channel_model = remote_device_model(remote, self._channel)
+                        if is_onvif_channel(remote, self._channel):
+                            # Say it once, plainly, instead of leaving a camera
+                            # entity that answers 400 for the life of the entry.
+                            _LOGGER.warning(
+                                "Channel %s of %s is attached to the recorder over ONVIF, "
+                                "not Dahua's own protocol. A recorder does not serve such a "
+                                "channel on its Dahua paths -- measured on a "
+                                "DHI-NVR5464-16P-EI, snapshot.cgi answers 400 for the ONVIF "
+                                "channel while every Dahua-protocol channel on the same "
+                                "recorder returns an image -- so video for this camera will "
+                                "not work here whatever channel number is used. Home "
+                                "Assistant's own ONVIF integration, pointed at the recorder "
+                                "rather than at the camera, does serve it (#646).",
+                                self._channel, self._address)
+                    except PROBE_FAILED:
+                        self._channel_model = None
+                    if self._channel_model:
+                        _LOGGER.debug(
+                            "Channel %s carries a %s; the device itself reports %s",
+                            self._channel, self._channel_model, self.model)
+                    if self._supports_smart_motion_detection:
+                        # Which rows the device reports is the whole capability
+                        # decision for this channel (#635), and nothing logged it.
+                        # #669 spent two rounds of guessing for want of this line,
+                        # because a response body is never logged at debug.
+                        _LOGGER.debug(
+                            "SmartMotionDetect rows reported: %s; this channel is %s, so its "
+                            "switch is %s",
+                            smart_motion_rows if smart_motion_rows else "none",
+                            self._channel,
+                            "created" if self._channel in (smart_motion_rows or ()) else "not created",
+                        )
 
-                is_doorbell = self.is_doorbell()
-                _LOGGER.debug("Device is a doorbell=%s", is_doorbell)
+                    is_doorbell = self.is_doorbell()
+                    _LOGGER.debug("Device is a doorbell=%s", is_doorbell)
 
-                is_flood_light = self.is_flood_light()
-                _LOGGER.debug("Device is a floodlight=%s", is_flood_light)
+                    is_flood_light = self.is_flood_light()
+                    _LOGGER.debug("Device is a floodlight=%s", is_flood_light)
 
-                self._supports_floodlightmode = self.supports_floodlightmode()
+                    self._supports_floodlightmode = self.supports_floodlightmode()
 
-                self._supports_lighting = await self.async_detect_lighting_support()
-                _LOGGER.debug("Device supports infrared lighting=%s", self.supports_infrared_light())
+                    self._supports_lighting = await self.async_detect_lighting_support()
+                    _LOGGER.debug("Device supports infrared lighting=%s", self.supports_infrared_light())
 
-#Checking lighting_v2 support
-                try:
-                    await self.client.async_get_lighting_v2()
-                    self._supports_lighting_v2 = True
-                except PROBE_FAILED:
-                    self._supports_lighting_v2 = False
-                    pass
-                _LOGGER.debug("Device supports Lighting_V2=%s", self._supports_lighting_v2)
+    #Checking lighting_v2 support
+                    try:
+                        await self.client.async_get_lighting_v2()
+                        self._supports_lighting_v2 = True
+                    except PROBE_FAILED:
+                        self._supports_lighting_v2 = False
+                        pass
+                    _LOGGER.debug("Device supports Lighting_V2=%s", self._supports_lighting_v2)
 
                 # IPC-Color4M-TZ accepts ordinary Lighting_V2 writes but its
                 # physical white emitter also requires LightingScheme. Probe
@@ -1511,6 +1637,12 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
 
         # This is the event loop code that's called every n seconds
         try:
+            if self._raysharp:
+                data = await self._async_update_raysharp(data)
+                async_record_host_success(self.hass, self._address)
+                self._restore_poll_interval()
+                return data
+
             # We need the profile mode (0=day, 1=night, 2=scene)
             if self._supports_profile_mode and not self.is_doorbell():
                 try:
@@ -1898,11 +2030,18 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         Returns true if this camera has a siren. For example, the IPC-HDW3849HP-AS-PV does
         https://dahuawiki.com/Template:NameConvention
         """
+        if self._raysharp:
+            return "AudioAlarm" in self._raysharp_channel_abilities
         m = self.model.upper()
         return "-AS-PV" in m or "L46N" in m or m.startswith("W452ASD")
 
     def supports_nvr_active_deterrence(self) -> bool:
         """Return whether NVR active-deterrence entities were explicitly enabled."""
+        if self._raysharp:
+            # Only expose when this channel actually has deterrence hardware.
+            return bool(
+                {"Floodlight", "AudioAlarm"} & set(self._raysharp_channel_abilities)
+            )
         return self._nvr_active_deterrence
 
     def supports_security_light(self) -> bool:
@@ -1911,6 +2050,8 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         IPC-HDW3849HP-AS-PV does https://dahuawiki.com/Template:NameConvention
         Addressed issue https://github.com/rroller/dahua/pull/405
         """
+        if self._raysharp:
+            return "Floodlight" in self._raysharp_channel_abilities
         m = self.model.upper()
         return (
             "-AS-PV" in m
@@ -1994,6 +2135,8 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
 
     def is_motion_detection_enabled(self) -> bool:
         """ Returns true if motion detection is enabled for the camera """
+        if self._raysharp:
+            return self._raysharp_motion_enabled
         return self.data.get("table.MotionDetect[{0}].Enable".format(self._channel), "").lower() == "true"
 
     def is_disarming_linkage_enabled(self) -> bool:
@@ -2033,6 +2176,8 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
 
     def is_siren_on(self) -> bool:
         """ Returns true if the camera siren is on """
+        if self._raysharp:
+            return self._raysharp_audio_alarm_on
         return self.get_status_value("Speaker").lower() == "on"
 
     def get_device_name(self) -> str:
@@ -2203,8 +2348,16 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
             return scheme_mode == "WhiteMode" and manually_on
         return manually_on
 
+    def is_security_light_on(self) -> bool:
+        """Return true if the security light is on. This is the red/blue flashing light"""
+        if self._raysharp:
+            return self._raysharp_floodlight_on
+        return self.get_status_value("WhiteLight").lower() == "on"
+
     def is_flood_light_on(self) -> bool:
 
+        if self._raysharp:
+            return self._raysharp_floodlight_on
         if self._supports_floodlightmode:
           # 'coaxialControlIO.cgi?action=getStatus&channel=1'
             return self.get_status_value("WhiteLight").lower() == "on"
@@ -2238,10 +2391,6 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
             )
         )
         return dahua_utils.dahua_brightness_to_hass_brightness(bri)
-
-    def is_security_light_on(self) -> bool:
-        """Return true if the security light is on. This is the red/blue flashing light"""
-        return self.get_status_value("WhiteLight").lower() == "on"
 
     def read_profile_mode(self, mode_data: dict) -> str:
         """Picks this channel's day/night profile out of the VideoInMode table.

@@ -153,7 +153,13 @@ class DigestAuth:
         # "[0]" while "%5B0%5D" was sent. A device that checks is entitled to
         # refuse that, and 403 is what refusing it looks like.
         path = URL(url).raw_path_qs
-        A1 = "%s:%s:%s" % (self.username, realm, self.password)
+
+        # RFC 7616 userhash=true (Lorex / Raysharp OpenResty): the username
+        # used in A1 and in the Authorization header is H(username:realm).
+        use_userhash = str(self.challenge.get("userhash", "")).lower() == "true"
+        auth_username = H("%s:%s" % (self.username, realm)) if use_userhash else self.username
+
+        A1 = "%s:%s:%s" % (auth_username, realm, self.password)
         A2 = "%s:%s" % (method, path)
 
         HA1 = H(A1)
@@ -192,7 +198,7 @@ class DigestAuth:
 
         base = ", ".join(
             [
-                'username="%s"' % self.username,
+                'username="%s"' % auth_username,
                 'realm="%s"' % realm,
                 'nonce="%s"' % nonce,
                 'uri="%s"' % path,
@@ -204,6 +210,8 @@ class DigestAuth:
             base += ', opaque="%s"' % opaque
         if qop:
             base += ', qop="auth", nc=%s, cnonce="%s"' % (ncvalue, cnonce)
+        if use_userhash:
+            base += ", userhash=true"
 
         return "Digest %s" % base
 

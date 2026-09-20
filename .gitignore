@@ -19,3 +19,6 @@ config/home-assistant.log
 config/home-assistant_v2.db-shm
 config/home-assistant_v2.db-wal
 !config/configuration.yaml
+# Local NVR probe artifacts
+.agents/nvr_probe/
+

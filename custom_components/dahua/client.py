@@ -2,6 +2,7 @@
 import logging
 import re
 import socket
+import json
 from copy import deepcopy
 from contextlib import suppress
 import asyncio
@@ -752,6 +753,10 @@ class DahuaClient:
         self._raysharp_session: aiohttp.ClientSession | None = None
         self._raysharp_logged_in: bool = False
         self._raysharp_lock = asyncio.Lock()
+        self._raysharp_csrf: str | None = None
+        self._raysharp_digest_state: dict = {}
+        # True once /API/Web/Login has succeeded for this client.
+        self.raysharp_mode: bool = False
 
     def _get_raysharp_session(self) -> aiohttp.ClientSession:
         """Returns or creates an aiohttp.ClientSession with CookieJar for Raysharp API."""
@@ -765,14 +770,18 @@ class DahuaClient:
 
     @property
     def login_url(self) -> str:
-        """URL for Raysharp login with Basic Auth credentials in the URL."""
-        encoded_user = quote(self._username, safe="")
-        encoded_pass = quote(self._password, safe="")
+        """URL for Raysharp Digest login (credentials are not embedded in the URL)."""
         protocol = "https" if self._use_https else "http"
-        return f"{protocol}://{encoded_user}:{encoded_pass}@{self._address}:{self._port}/API/Web/Login"
+        return f"{protocol}://{self._address}:{self._port}/API/Web/Login"
+
+    def _raysharp_headers(self) -> dict:
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if self._raysharp_csrf:
+            headers["X-csrftoken"] = self._raysharp_csrf
+        return headers
 
     async def async_login(self) -> bool:
-        """Log in to Raysharp / Lorex NVR and store session cookies."""
+        """Log in to Raysharp / Lorex NVR via Digest Auth (userhash) and store session + CSRF."""
         async with self._raysharp_lock:
             session = self._get_raysharp_session()
             login_payload = {
@@ -781,21 +790,31 @@ class DahuaClient:
                     "remote_terminal_info": "WEB,chrome",
                 }
             }
-            _LOGGER.debug("Attempting Raysharp login to %s", self._address)
+            _LOGGER.debug("Attempting Raysharp Digest login to %s", self._address)
             try:
-                async with session.post(
+                auth = DigestAuth(
+                    self._username, self._password, session, self._raysharp_digest_state
+                )
+                response = await auth.request(
+                    "POST",
                     self.login_url,
                     json=login_payload,
                     timeout=aiohttp.ClientTimeout(total=TIMEOUT_SECONDS),
-                ) as response:
+                )
+                async with response:
                     if response.status == 401:
                         self._raysharp_logged_in = False
+                        self.raysharp_mode = False
                         raise RaysharpAuthError("Invalid credentials for NVR login (HTTP 401)")
 
                     response.raise_for_status()
                     data = await response.json(content_type=None)
                     if isinstance(data, dict) and data.get("result") == "success":
+                        self._raysharp_csrf = (
+                            response.headers.get("X-csrftoken") or self._raysharp_csrf
+                        )
                         self._raysharp_logged_in = True
+                        self.raysharp_mode = True
                         _LOGGER.info("Successfully logged in to Raysharp NVR (%s)", self._address)
                         return True
 
@@ -809,12 +828,17 @@ class DahuaClient:
     async def async_post_json(
         self,
         endpoint: str,
-        payload: dict,
+        payload: dict | None = None,
         retry_on_auth_fail: bool = True,
     ) -> dict:
         """Post JSON payload to Raysharp NVR endpoint with automatic re-auth."""
         if not self._raysharp_logged_in:
             await self.async_login()
+
+        if payload is None:
+            payload = {"version": "1.0", "data": {}}
+        elif "version" not in payload:
+            payload = {"version": "1.0", "data": payload}
 
         url = f"{self._base}{endpoint}"
         session = self._get_raysharp_session()
@@ -823,28 +847,41 @@ class DahuaClient:
             async with session.post(
                 url,
                 json=payload,
+                headers=self._raysharp_headers(),
                 timeout=aiohttp.ClientTimeout(total=TIMEOUT_SECONDS),
             ) as response:
-                if response.status == 401 and retry_on_auth_fail:
-                    _LOGGER.warning("Raysharp session expired (HTTP 401), re-authenticating...")
+                text = await response.text()
+                try:
+                    data = json.loads(text) if text else {}
+                except json.JSONDecodeError:
+                    data = {"raw": text}
+
+                csrf = response.headers.get("X-csrftoken")
+                if csrf:
+                    self._raysharp_csrf = csrf
+
+                err_code = data.get("error_code") if isinstance(data, dict) else None
+                result = data.get("result") if isinstance(data, dict) else None
+
+                needs_reauth = (
+                    response.status == 401
+                    or err_code in ("one_IE", "expired", "have_login", "logout")
+                    or result in ("session_timeout", "auth_failed", "unauthorized", "expired")
+                )
+                if needs_reauth and retry_on_auth_fail:
+                    _LOGGER.warning(
+                        "Raysharp session needs re-auth (status=%s code=%s), re-authenticating...",
+                        response.status,
+                        err_code or result,
+                    )
                     self._raysharp_logged_in = False
                     await self.async_login()
                     return await self.async_post_json(endpoint, payload, retry_on_auth_fail=False)
 
-                response.raise_for_status()
-                data = await response.json(content_type=None)
+                if response.status >= 400:
+                    raise RaysharpApiError(f"HTTP {response.status} for {endpoint}: {data}")
 
-                if (
-                    isinstance(data, dict)
-                    and data.get("result") in ("session_timeout", "auth_failed", "unauthorized")
-                    and retry_on_auth_fail
-                ):
-                    _LOGGER.warning("Raysharp session timed out (%s), re-authenticating...", data.get("result"))
-                    self._raysharp_logged_in = False
-                    await self.async_login()
-                    return await self.async_post_json(endpoint, payload, retry_on_auth_fail=False)
-
-                return data
+                return data if isinstance(data, dict) else {"result": "success", "data": data}
         except aiohttp.ClientResponseError as err:
             if err.status == 401 and retry_on_auth_fail:
                 self._raysharp_logged_in = False
@@ -897,25 +934,35 @@ class DahuaClient:
             return True
         raise RaysharpApiError(f"Failed to set MotionDetection: {response}")
 
+    @staticmethod
+    def raysharp_channel_key(channel: int | str) -> str:
+        """Normalize a channel index/number/string to CH1..CHn."""
+        if isinstance(channel, str):
+            cleaned = channel.upper().replace("CH", "").strip()
+            try:
+                num = int(cleaned)
+            except ValueError:
+                return "CH1"
+        else:
+            try:
+                num = int(channel)
+            except (TypeError, ValueError):
+                return "CH1"
+        if num <= 0:
+            num = 1
+        return f"CH{num}"
+
     def get_rtsp_stream_url(self, channel: int | str, subtype: int) -> str:
         """
         Returns the RTSP URL for Lorex/Raysharp NVR streaming.
-        Format: rtsp://[user:pass@]ip:port/rtsp/streaming?channel=A&subtype=B
-        A: 01(ch1), 02(ch2)..
-        B: 0(main stream), 1(sub stream)
-        """
-        try:
-            if isinstance(channel, str):
-                cleaned = channel.upper().replace("CH", "").strip()
-                chn_num = int(cleaned)
-            else:
-                chn_num = int(channel)
-            if chn_num <= 0:
-                chn_num = 1
-        except (ValueError, TypeError):
-            chn_num = 1
 
-        channel_str = f"{chn_num:02d}"
+        Verified on RN101A Preview/StreamUrl/Get:
+        rtsp://host/rtsp/streaming?channel=1&subtype=0  (main)
+        rtsp://host/rtsp/streaming?channel=1&subtype=1  (sub)
+        Channel is 1-based and not zero-padded.
+        """
+        key = self.raysharp_channel_key(channel)
+        chn_num = int(key[2:])
         subtype_str = "0" if subtype == 0 else "1"
 
         auth = ""
@@ -925,96 +972,212 @@ class DahuaClient:
             else:
                 auth = f"{quote(self._username, safe='')}@"
 
-        return f"rtsp://{auth}{self._address}:{self._rtsp_port}/rtsp/streaming?channel={channel_str}&subtype={subtype_str}"
+        return (
+            f"rtsp://{auth}{self._address}:{self._rtsp_port}"
+            f"/rtsp/streaming?channel={chn_num}&subtype={subtype_str}"
+        )
+
+    async def async_get_channel_info(self) -> dict:
+        """Return Login/ChannelInfo/Get payload (abilities per channel)."""
+        resp = await self.async_post_json("/API/Login/ChannelInfo/Get")
+        return resp.get("data", {}) if isinstance(resp, dict) else {}
+
+    async def async_event_check(self) -> dict:
+        """Poll live alarm/deterrence state via Event/Check."""
+        resp = await self.async_post_json("/API/Event/Check")
+        return resp.get("data", {}) if isinstance(resp, dict) else {}
+
+    async def async_get_chn_smart(self) -> dict:
+        """Return Event/ChnSmart/Get (motion detection enable state per channel)."""
+        resp = await self.async_post_json("/API/Event/ChnSmart/Get")
+        return resp.get("data", {}) if isinstance(resp, dict) else {}
+
+    async def async_set_floodlight_audio_alarm(
+        self,
+        channel: int | str,
+        *,
+        floodlight: bool | None = None,
+        floodlight_value: int = 50,
+        audio_alarm: bool | None = None,
+        audio_alarm_value: int = 8,
+        red_blue_light: bool | None = None,
+    ) -> dict:
+        """Control Live-view deterrence light / siren on a Raysharp channel.
+
+        Endpoint verified on Lorex RN101A:
+        POST /API/PreviewChannel/Floodlight2AudioAlarm/Set
+        """
+        ch_key = self.raysharp_channel_key(channel)
+        # Read current state so we only toggle the requested outputs.
+        current = {
+            "floodlight_switch": False,
+            "floodlight_value": floodlight_value,
+            "audioAlarm_switch": False,
+            "audioAlarm_value": audio_alarm_value,
+            "redBlueLight_switch": False,
+        }
+        try:
+            events = await self.async_event_check()
+            for block in events.get("alarm_list") or []:
+                for ch in block.get("channel_alarm") or []:
+                    if ch.get("channel") == ch_key:
+                        fa = ch.get("Floodlight_AudioAlarm") or {}
+                        current.update(
+                            {
+                                "floodlight_switch": bool(fa.get("floodlight_switch")),
+                                "floodlight_value": int(fa.get("floodlight_value", floodlight_value)),
+                                "audioAlarm_switch": bool(fa.get("audioAlarm_switch")),
+                                "audioAlarm_value": int(fa.get("audioAlarm_value", audio_alarm_value)),
+                                "redBlueLight_switch": bool(fa.get("redBlueLight_switch")),
+                            }
+                        )
+                        break
+        except RaysharpApiError:
+            _LOGGER.debug("Could not pre-read Floodlight_AudioAlarm for %s", ch_key)
+
+        if floodlight is not None:
+            current["floodlight_switch"] = bool(floodlight)
+            current["floodlight_value"] = floodlight_value
+        if audio_alarm is not None:
+            current["audioAlarm_switch"] = bool(audio_alarm)
+            current["audioAlarm_value"] = audio_alarm_value
+        if red_blue_light is not None:
+            current["redBlueLight_switch"] = bool(red_blue_light)
+
+        payload = {"version": "1.0", "data": {"channel": ch_key, **current}}
+        resp = await self.async_post_json(
+            "/API/PreviewChannel/Floodlight2AudioAlarm/Set", payload
+        )
+        if isinstance(resp, dict) and resp.get("result") == "success":
+            return resp
+        raise RaysharpApiError(f"Failed Floodlight2AudioAlarm/Set for {ch_key}: {resp}")
 
     async def async_get_snapshot(self, channel_number: int) -> bytes:
         """
-        Takes a snapshot of the camera and returns the binary jpeg data
-        NOTE: channel_number is not the channel_index. channel_number is the index + 1
-        so channel index 0 is channel number 1. Except for some older firmwares where channel
-        and channel number are the same!
+        Takes a snapshot of the camera and returns the binary JPEG data via Raysharp API.
+        channel_number is 1-based (channel index 0 → channel_number 1).
         """
-        url = "/cgi-bin/snapshot.cgi?channel={0}".format(channel_number)
-        return repair_dahua_snapshot_header(
-            strip_dahua_snapshot_trailer(await self.get_bytes(url)))
+        ch_key = self.raysharp_channel_key(channel_number)
+        payload = {"version": "1.0", "data": {"channel": ch_key}}
+        try:
+            resp = await self.async_post_json("/API/Snapshot/Get", payload)
+            if isinstance(resp, bytes):
+                return resp
+            if isinstance(resp, dict):
+                import base64
+
+                img_b64 = resp.get("data", {}).get("image") or resp.get("image")
+                if img_b64:
+                    return base64.b64decode(img_b64)
+            return b""
+        except RaysharpApiError as err:
+            _LOGGER.warning("Raysharp snapshot failed for channel %s: %s", ch_key, err)
+            return b""
 
     async def async_get_system_info(self) -> dict:
         """
-        Get system info data from the getSystemInfo API. Example response:
-
-        appAutoStart=true
-        deviceType=IPC-HDW5831R-ZE
-        hardwareVersion=1.00
-        processor=S3LM
-        serialNumber=4X7C5A1ZAG21L3F
-        updateSerial=IPC-HDW5830R-Z
-        updateSerialCloudUpgrade=IPC-HDW5830R-Z:07:01:08:70:52:00:09:0E:03:00:04:8F0:00:00:00:00:00:02:00:00:600
+        Get system info from Raysharp NVR via /API/Login/DeviceInfo/Get.
+        Returns a normalised dict with keys: serialNumber, deviceType, softwareVersion, machineName.
+        Falls back to credential-derived ID on failure.
         """
         try:
-            return await self.get("/cgi-bin/magicBox.cgi?action=getSystemInfo")
-        except aiohttp.ClientResponseError as e:
-            if _is_login_refused(e):
-                raise
+            resp = await self.async_post_json(
+                "/API/Login/DeviceInfo/Get",
+                {"version": "1.0", "data": {}},
+            )
+            data = resp.get("data", {}) if isinstance(resp, dict) else {}
+            serial = (
+                data.get("serial_no")
+                or data.get("serialNumber")
+                or data.get("sn")
+                or (data.get("mac_addr") or "").replace("-", "")
+                or ""
+            )
+            device_type = (
+                data.get("device_name")
+                or data.get("device_type")
+                or data.get("model")
+                or data.get("deviceType")
+                or "Lorex NVR"
+            )
+            # Some firmwares put a numeric device_type; prefer a readable name.
+            if isinstance(device_type, (int, float)) or (
+                isinstance(device_type, str) and device_type.isdigit()
+            ):
+                device_type = data.get("device_name") or "RN101A"
+            return {
+                "serialNumber": serial,
+                "deviceType": str(device_type),
+                "softwareVersion": (
+                    data.get("site_version")
+                    or data.get("firmware_version")
+                    or data.get("softwareVersion")
+                    or "1.0"
+                ),
+                "machineName": data.get("device_name") or data.get("name") or "Lorex NVR",
+                "table.General.MachineName": data.get("device_name")
+                or data.get("name")
+                or "Lorex NVR",
+                "_raw": data,
+            }
+        except (RaysharpAuthError, RaysharpApiError) as err:
+            _LOGGER.warning("Raysharp DeviceInfo failed: %s — deriving ID from credentials", err)
             self.identity_derived_from_credentials = True
-            not_hashed_id = "{0}_{1}_{2}_{3}".format(self._address, self._rtsp_port, self._username, self._password)
-            unique_cam_id = md5(not_hashed_id.encode('UTF-8')).hexdigest()
-            return {"serialNumber": unique_cam_id}
+            not_hashed_id = "{0}_{1}_{2}_{3}".format(
+                self._address, self._rtsp_port, self._username, self._password
+            )
+            unique_cam_id = md5(not_hashed_id.encode("UTF-8")).hexdigest()
+            return {
+                "serialNumber": unique_cam_id,
+                "deviceType": "Lorex NVR",
+                "softwareVersion": "1.0",
+                "machineName": "Lorex NVR",
+            }
+
+    # Cache for device info so we don't re-fetch on every call
+    _device_info_cache: dict | None = None
+
+    async def _get_device_info_cached(self) -> dict:
+        """Return cached device info, fetching once if not yet available."""
+        if not self._device_info_cache:
+            self._device_info_cache = await self.async_get_system_info()
+        return self._device_info_cache
 
     async def get_device_type(self) -> dict:
-        """
-        getDeviceType returns the device type. Example response:
-        type=IPC-HDW5831R-ZE
-        ...
-        Some cams might return...
-        type=IP Camera
-        """
-        try:
-            return await self.get("/cgi-bin/magicBox.cgi?action=getDeviceType")
-        except aiohttp.ClientResponseError as e:
-            return {"type": "Generic RTSP"}
+        """Return the device model/type from the Raysharp device info."""
+        info = await self._get_device_info_cached()
+        return {"type": info.get("deviceType", "Lorex NVR")}
 
     async def get_software_version(self) -> dict:
-        """
-        get_software_version returns the device software version (also known as the firmware version). Example response:
-        version=2.800.0000016.0.R,build:2020-06-05
-        """
-        try:
-            return await self.get("/cgi-bin/magicBox.cgi?action=getSoftwareVersion")
-        except aiohttp.ClientResponseError as e:
-            return {"version": "1.0"}
+        """Return the firmware version from the Raysharp device info."""
+        info = await self._get_device_info_cached()
+        return {"version": info.get("softwareVersion", "1.0")}
 
     async def get_machine_name(self) -> dict:
-        """ get_machine_name returns the device name. Example response: name=FrontDoorCam """
-        try:
-            return await self.get("/cgi-bin/magicBox.cgi?action=getMachineName")
-        except aiohttp.ClientResponseError as e:
-            if _is_login_refused(e):
-                raise
-            self.identity_derived_from_credentials = True
-            not_hashed_id = "{0}_{1}_{2}_{3}".format(self._address, self._rtsp_port, self._username, self._password)
-            unique_cam_id = md5(not_hashed_id.encode('UTF-8')).hexdigest()
-            return {"name": unique_cam_id}
+        """Return the device name from the Raysharp device info."""
+        info = await self._get_device_info_cached()
+        return {"name": info.get("machineName", "Lorex NVR")}
 
     async def get_vendor(self) -> dict:
-        """ get_vendor returns the vendor. Example response: vendor=Dahua """
-        try:
-            return await self.get("/cgi-bin/magicBox.cgi?action=getVendor")
-        except aiohttp.ClientResponseError as e:
-            return {"vendor": "Generic RTSP"}
+        """Return vendor name (always Lorex/Raysharp for this integration)."""
+        return {"vendor": "Lorex"}
 
     async def reboot(self) -> dict:
-        """ Reboots the device """
-        return await self.get("/cgi-bin/magicBox.cgi?action=reboot")
+        """Reboot the NVR via Raysharp API."""
+        try:
+            return await self.async_post_json(
+                "/API/Maintenance/DeviceReboot/Set",
+                {"version": "1.0", "data": {}},
+            )
+        except (RaysharpAuthError, RaysharpApiError) as err:
+            _LOGGER.error("Reboot failed: %s", err)
+            return {}
 
     async def get_max_extra_streams(self) -> int:
-        """ get_max_extra_streams returns the max number of sub streams supported by the camera """
-        try:
-            result = await self.get("/cgi-bin/magicBox.cgi?action=getProductDefinition&name=MaxExtraStream")
-        except aiohttp.ClientResponseError:
-            # No such endpoint on this device. Assume the standard 2, which is
-            # what this comment has always said -- the code returned 3.
-            return DEFAULT_EXTRA_STREAMS
-        return parse_extra_streams(result.get("table.MaxExtraStream"))
+        """Return the maximum number of sub-streams supported.
+        Raysharp NVRs typically support 1 sub-stream per channel.
+        """
+        return DEFAULT_EXTRA_STREAMS
 
     async def async_get_alarm_output_slots(self) -> dict:
         """Return the number of physical alarm-output slots reported by the device."""
@@ -1947,7 +2110,21 @@ class DahuaClient:
     async def async_set_nvr_coaxial_control_state(
         self, channel: int, dahua_type: int, enabled: bool
     ) -> dict:
-        """Set an NVR-connected camera's coaxial deterrence state."""
+        """Set an NVR-connected camera's coaxial deterrence state.
+
+        On Lorex/Raysharp NVRs this is PreviewChannel/Floodlight2AudioAlarm/Set,
+        not Dahua coaxialControlIO.cgi.
+        """
+        if self.raysharp_mode:
+            if dahua_type == SIREN_TYPE:
+                return await self.async_set_floodlight_audio_alarm(
+                    channel, audio_alarm=enabled
+                )
+            # SECURITY_LIGHT_TYPE and floodlight share the white/warning light.
+            return await self.async_set_floodlight_audio_alarm(
+                channel, floodlight=enabled
+            )
+
         io = 1 if enabled else 2
         url = (
             "/cgi-bin/coaxialControlIO.cgi?action=control&channel={channel}"
