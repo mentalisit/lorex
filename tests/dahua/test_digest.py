@@ -308,6 +308,18 @@ class UserhashSession(FakeSession):
         return FakeResponse(200, body=self.body)
 
 
+async def test_algorithm_and_qop_go_on_the_wire_as_tokens():
+    """RFC 7616 3.4: quoting either is an error a strict parser may refuse on."""
+    session = FakeSession()
+
+    await DigestAuth(USER, PASSWORD, session, {}).request("GET", "http://d/x")
+
+    header = session.requests[-1]["headers"]["AUTHORIZATION"]
+    assert "algorithm=MD5," in header
+    assert "qop=auth," in header
+    assert 'algorithm="' not in header and 'qop="' not in header
+
+
 async def test_userhash_hides_the_name_but_signs_the_plain_one():
     session = UserhashSession()
 

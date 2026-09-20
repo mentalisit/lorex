@@ -199,6 +199,10 @@ class DigestAuth:
         else:
             response_digest = KD(HA1, "%s:%s" % (nonce, HA2))
 
+        # algorithm and qop are tokens, not quoted strings (RFC 7616 3.4), and
+        # a strict parser is entitled to read "MD5" with the quotes as an
+        # algorithm it does not have -- which is what a device that answers
+        # curl but not us looks like. This is byte-for-byte what curl sends.
         base = ", ".join(
             [
                 'username="%s"' % auth_username,
@@ -206,13 +210,13 @@ class DigestAuth:
                 'nonce="%s"' % nonce,
                 'uri="%s"' % path,
                 'response="%s"' % response_digest,
-                'algorithm="%s"' % algorithm,
+                "algorithm=%s" % algorithm,
             ]
         )
         if opaque:
             base += ', opaque="%s"' % opaque
         if qop:
-            base += ', qop="auth", nc=%s, cnonce="%s"' % (ncvalue, cnonce)
+            base += ', qop=auth, nc=%s, cnonce="%s"' % (ncvalue, cnonce)
         if use_userhash:
             base += ", userhash=true"
 
