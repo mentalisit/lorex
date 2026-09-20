@@ -672,6 +672,17 @@ def parse_extra_streams(value) -> int:
     return count
 
 
+def rtsp_userinfo(value: str) -> str:
+    """Escape a username or password for the userinfo part of an RTSP URL.
+
+    ffmpeg's RTSP demuxer splits the userinfo off the URL and uses it verbatim
+    in the Digest/Basic response, without percent-decoding it. Encoding the
+    whole value therefore signs the escaped text and the device answers 401.
+    Only the delimiters that would break the split are escaped.
+    """
+    return quote(value, safe="!$&'()*+,;=-._~")
+
+
 def _is_login_refused(exception: aiohttp.ClientResponseError) -> bool:
     """True when the device refused the credentials, not the endpoint.
 
@@ -785,10 +796,11 @@ class DahuaClient:
         async with self._raysharp_lock:
             session = self._get_raysharp_session()
             login_payload = {
+                "version": "1.0",
                 "data": {
                     "support_new_schedule": True,
                     "remote_terminal_info": "WEB,chrome",
-                }
+                },
             }
             _LOGGER.debug("Attempting Raysharp Digest login to %s", self._address)
             try:
@@ -807,8 +819,15 @@ class DahuaClient:
                         self.raysharp_mode = False
                         raise RaysharpAuthError("Invalid credentials for NVR login (HTTP 401)")
 
-                    response.raise_for_status()
-                    data = await response.json(content_type=None)
+                    text = await response.text()
+                    if response.status >= 400:
+                        raise RaysharpApiError(
+                            f"Login to {self._address} failed: HTTP {response.status}: {text}"
+                        )
+                    try:
+                        data = json.loads(text) if text else {}
+                    except json.JSONDecodeError:
+                        data = {"raw": text}
                     if isinstance(data, dict) and data.get("result") == "success":
                         self._raysharp_csrf = (
                             response.headers.get("X-csrftoken") or self._raysharp_csrf
@@ -1008,9 +1027,9 @@ class DahuaClient:
         auth = ""
         if self._username:
             if self._password:
-                auth = f"{quote(self._username, safe='')}:{quote(self._password, safe='')}@"
+                auth = f"{rtsp_userinfo(self._username)}:{rtsp_userinfo(self._password)}@"
             else:
-                auth = f"{quote(self._username, safe='')}@"
+                auth = f"{rtsp_userinfo(self._username)}@"
 
         return (
             f"rtsp://{auth}{self._address}:{self._rtsp_port}"

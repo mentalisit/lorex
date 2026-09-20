@@ -9,7 +9,7 @@ import logging
 import sys
 
 import aiohttp
-from custom_components.dahua.models import CoaxialControlIOStatus
+from .models import CoaxialControlIOStatus
 
 _LOGGER: logging.Logger = logging.getLogger(__package__)
 _PARAMS_UNSET = object()

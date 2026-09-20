@@ -8,7 +8,7 @@ from homeassistant.components.button import ButtonDeviceClass, ButtonEntity
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 
-from custom_components.dahua import DahuaDataUpdateCoordinator
+from . import DahuaDataUpdateCoordinator
 
 from .const import DOMAIN
 from .entity import DahuaBaseEntity

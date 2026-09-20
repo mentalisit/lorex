@@ -3,7 +3,7 @@ import logging
 
 from homeassistant.core import HomeAssistant
 from homeassistant.components.select import SelectEntity
-from custom_components.dahua import DahuaDataUpdateCoordinator
+from . import DahuaDataUpdateCoordinator
 
 from .const import DOMAIN
 from .entity import DahuaBaseEntity

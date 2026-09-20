@@ -1,5 +1,5 @@
 """DahuaBaseEntity class"""
-from custom_components.dahua import DahuaDataUpdateCoordinator, async_host_is_unreachable
+from . import DahuaDataUpdateCoordinator, async_host_is_unreachable
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import DOMAIN, ATTRIBUTION
 
