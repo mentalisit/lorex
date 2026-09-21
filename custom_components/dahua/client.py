@@ -218,22 +218,54 @@ def _digest_state(device: str, username: str) -> dict:
 # second, and a fresh entry (or a reload) starts with an empty deadline. Keyed
 # by device and user for the same reasons the digest state is.
 _RAYSHARP_BLOCKS: dict = {}
-
-# The shortest hold to take after a refusal the device did not put a time on.
 RAYSHARP_MIN_BLOCK_SECONDS = 180
 
-# One login in flight per account, so the channels of an NVR queue behind the
-# first attempt instead of spending four of the device's few tries at once.
-_RAYSHARP_LOGIN_LOCKS: dict = {}
+# Shared Raysharp / Lorex JSON sessions keyed by (device, username).
+_HOST_RAYSHARP: dict = {}
 
 
-def _raysharp_login_lock(device: str, username: str) -> asyncio.Lock:
-    """The login lock shared by every client for this device and user."""
-    key = (device, username)
-    lock = _RAYSHARP_LOGIN_LOCKS.get(key)
-    if lock is None:
-        lock = _RAYSHARP_LOGIN_LOCKS[key] = asyncio.Lock()
-    return lock
+class _SharedRaysharpSession:
+    """One authenticated HTTP session and CSRF token shared across all channels for one host & user."""
+
+    __slots__ = (
+        "session",
+        "csrf",
+        "logged_in",
+        "task",
+        "refs",
+        "digest_state",
+        "device",
+        "username",
+    )
+
+    def __init__(
+        self,
+        device: str,
+        username: str,
+        session: aiohttp.ClientSession,
+        digest_state: dict,
+    ) -> None:
+        self.device = device
+        self.username = username
+        self.session = session
+        self.digest_state = digest_state
+        self.csrf: str | None = None
+        self.logged_in: bool = False
+        self.task: asyncio.Future | None = None
+        self.refs = 0
+
+
+async def _release_raysharp(key) -> None:
+    """Give back one client's share of a host's Raysharp session."""
+    holder = _HOST_RAYSHARP.get(key)
+    if holder is None:
+        return
+    holder.refs -= 1
+    if holder.refs > 0:
+        return
+    del _HOST_RAYSHARP[key]
+    if holder.session is not None and not holder.session.closed:
+        await holder.session.close()
 
 
 def _overlay_text(*parts: str) -> str:
@@ -786,38 +818,36 @@ class DahuaClient:
         self._base = "{0}://{1}:{2}".format(protocol, self._address, port)
 
         # Raysharp / Lorex JSON API session state
-        self._raysharp_session: aiohttp.ClientSession | None = None
-        self._raysharp_logged_in: bool = False
-        self._raysharp_key = (_device_key(self._address, port), username)
-        self._raysharp_lock = _raysharp_login_lock(*self._raysharp_key)
-        self._raysharp_csrf: str | None = None
-        # Shared for the reason the CGI challenge is: four entries each taking
-        # their own 401 is four more chances to be counted as a failed attempt.
-        self._raysharp_digest_state = _digest_state(*self._raysharp_key)
-        # True once /API/Web/Login has succeeded for this client.
+        self._raysharp_key = (self._device, username)
+        self._raysharp_acquired = False
+        self._raysharp_released = False
+        # True once /API/Web/Login has succeeded for this client or its shared session.
         self.raysharp_mode: bool = False
 
-    def _get_raysharp_session(self) -> aiohttp.ClientSession:
-        """Returns or creates an aiohttp.ClientSession with CookieJar for Raysharp API."""
-        if self._raysharp_session is None or self._raysharp_session.closed:
+    async def _shared_raysharp(self) -> _SharedRaysharpSession:
+        """Returns or creates the shared Raysharp session holder for this device and user."""
+        key = self._raysharp_key
+        holder = _HOST_RAYSHARP.get(key)
+        if holder is None or holder.session.closed:
             cookie_jar = aiohttp.CookieJar(unsafe=True)
-            self._raysharp_session = aiohttp.ClientSession(
+            session = aiohttp.ClientSession(
                 connector=aiohttp.TCPConnector(ssl=False),
                 cookie_jar=cookie_jar,
             )
-        return self._raysharp_session
+            holder = _SharedRaysharpSession(
+                self._device, self._username, session, _digest_state(*key)
+            )
+            _HOST_RAYSHARP[key] = holder
+        if not self._raysharp_acquired:
+            holder.refs += 1
+            self._raysharp_acquired = True
+        return holder
 
     @property
     def login_url(self) -> str:
         """URL for Raysharp Digest login (credentials are not embedded in the URL)."""
         protocol = "https" if self._use_https else "http"
         return f"{protocol}://{self._address}:{self._port}/API/Web/Login"
-
-    def _raysharp_headers(self) -> dict:
-        headers = {"Content-Type": "application/json", "Accept": "application/json"}
-        if self._raysharp_csrf:
-            headers["X-csrftoken"] = self._raysharp_csrf
-        return headers
 
     def _raysharp_note_refusal(self, data: dict) -> None:
         """Hold off logging in again while the NVR has the account blocked.
@@ -837,74 +867,95 @@ class DahuaClient:
 
     async def async_login(self) -> bool:
         """Log in to Raysharp / Lorex NVR via Digest Auth (userhash) and store session + CSRF."""
-        async with self._raysharp_lock:
-            blocked_for = _RAYSHARP_BLOCKS.get(self._raysharp_key, 0.0) - time.monotonic()
-            if blocked_for > 0:
-                raise RaysharpAuthError(
-                    f"{self._address} refused these credentials; "
-                    f"not retrying for {int(blocked_for)}s"
-                )
-            session = self._get_raysharp_session()
-            login_payload = {
-                "version": "1.0",
-                "data": {
-                    "support_new_schedule": True,
-                    "remote_terminal_info": "WEB,chrome",
-                },
-            }
-            _LOGGER.debug("Attempting Raysharp Digest login to %s", self._address)
-            try:
-                auth = DigestAuth(
-                    self._username, self._password, session, self._raysharp_digest_state
-                )
-                response = await auth.request(
-                    "POST",
-                    self.login_url,
-                    json=login_payload,
-                    timeout=aiohttp.ClientTimeout(total=TIMEOUT_SECONDS),
-                )
-                async with response:
-                    if response.status == 401:
-                        self._raysharp_logged_in = False
-                        self.raysharp_mode = False
-                        raise RaysharpAuthError("Invalid credentials for NVR login (HTTP 401)")
+        holder = await self._shared_raysharp()
+        blocked_for = _RAYSHARP_BLOCKS.get(self._raysharp_key, 0.0) - time.monotonic()
+        if blocked_for > 0:
+            raise RaysharpAuthError(
+                f"{self._address} refused these credentials; "
+                f"not retrying for {int(blocked_for)}s"
+            )
 
-                    text = await response.text()
-                    try:
-                        data = json.loads(text) if text else {}
-                    except json.JSONDecodeError:
-                        data = {"raw": text}
-                    if not isinstance(data, dict):
-                        data = {"raw": data}
+        if holder.logged_in:
+            self.raysharp_mode = True
+            return True
 
-                    if data.get("error_code") == "verify_failed":
-                        self._raysharp_logged_in = False
-                        self._raysharp_note_refusal(data)
-                        raise RaysharpAuthError(
-                            f"{self._address} rejected the credentials: "
-                            f"{data.get('reason', text)}"
-                        )
+        if holder.task is None or holder.task.done():
+            holder.task = asyncio.ensure_future(self._do_raysharp_login(holder))
 
-                    if response.status >= 400:
-                        raise RaysharpApiError(
-                            f"Login to {self._address} failed: HTTP {response.status}: {text}"
-                        )
-                    if data.get("result") == "success":
-                        _RAYSHARP_BLOCKS.pop(self._raysharp_key, None)
-                        self._raysharp_csrf = (
-                            response.headers.get("X-csrftoken") or self._raysharp_csrf
-                        )
-                        self._raysharp_logged_in = True
-                        self.raysharp_mode = True
-                        _LOGGER.info("Successfully logged in to Raysharp NVR (%s)", self._address)
-                        return True
+        try:
+            res = await asyncio.shield(holder.task)
+            self.raysharp_mode = True
+            return res
+        except Exception:
+            if (
+                _HOST_RAYSHARP.get(self._raysharp_key) is holder
+                and holder.task is not None
+                and holder.task.done()
+            ):
+                holder.task = None
+            raise
 
-                    self._raysharp_logged_in = False
-                    raise RaysharpAuthError(f"Raysharp login rejected: {data}")
-            except (aiohttp.ClientError, asyncio.TimeoutError) as err:
-                self._raysharp_logged_in = False
-                _LOGGER.error("Network error during login to %s: %s", self._address, err)
-                raise RaysharpApiError(f"Could not connect to NVR: {err}") from err
+    async def _do_raysharp_login(self, holder: _SharedRaysharpSession) -> bool:
+        login_payload = {
+            "version": "1.0",
+            "data": {
+                "support_new_schedule": True,
+                "remote_terminal_info": "WEB,chrome",
+            },
+        }
+        _LOGGER.debug("Attempting Raysharp Digest login to %s", self._address)
+        try:
+            auth = DigestAuth(
+                self._username, self._password, holder.session, holder.digest_state
+            )
+            response = await auth.request(
+                "POST",
+                self.login_url,
+                json=login_payload,
+                timeout=aiohttp.ClientTimeout(total=TIMEOUT_SECONDS),
+            )
+            async with response:
+                if response.status == 401:
+                    holder.logged_in = False
+                    self.raysharp_mode = False
+                    raise RaysharpAuthError("Invalid credentials for NVR login (HTTP 401)")
+
+                text = await response.text()
+                try:
+                    data = json.loads(text) if text else {}
+                except json.JSONDecodeError:
+                    data = {"raw": text}
+                if not isinstance(data, dict):
+                    data = {"raw": data}
+
+                if data.get("error_code") == "verify_failed":
+                    holder.logged_in = False
+                    self._raysharp_note_refusal(data)
+                    raise RaysharpAuthError(
+                        f"{self._address} rejected the credentials: "
+                        f"{data.get('reason', text)}"
+                    )
+
+                if response.status >= 400:
+                    raise RaysharpApiError(
+                        f"Login to {self._address} failed: HTTP {response.status}: {text}"
+                    )
+                if data.get("result") == "success":
+                    _RAYSHARP_BLOCKS.pop(self._raysharp_key, None)
+                    holder.csrf = (
+                        response.headers.get("X-csrftoken") or holder.csrf
+                    )
+                    holder.logged_in = True
+                    self.raysharp_mode = True
+                    _LOGGER.info("Successfully logged in to Raysharp NVR (%s)", self._address)
+                    return True
+
+                holder.logged_in = False
+                raise RaysharpAuthError(f"Raysharp login rejected: {data}")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            holder.logged_in = False
+            _LOGGER.error("Network error during login to %s: %s", self._address, err)
+            raise RaysharpApiError(f"Could not connect to NVR: {err}") from err
 
     async def async_post_json(
         self,
@@ -913,7 +964,8 @@ class DahuaClient:
         retry_on_auth_fail: bool = True,
     ) -> dict:
         """Post JSON payload to Raysharp NVR endpoint with automatic re-auth."""
-        if not self._raysharp_logged_in:
+        holder = await self._shared_raysharp()
+        if not holder.logged_in:
             await self.async_login()
 
         if payload is None:
@@ -922,13 +974,15 @@ class DahuaClient:
             payload = {"version": "1.0", "data": payload}
 
         url = f"{self._base}{endpoint}"
-        session = self._get_raysharp_session()
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if holder.csrf:
+            headers["X-csrftoken"] = holder.csrf
 
         try:
-            async with session.post(
+            async with holder.session.post(
                 url,
                 json=payload,
-                headers=self._raysharp_headers(),
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=TIMEOUT_SECONDS),
             ) as response:
                 text = await response.text()
@@ -939,7 +993,7 @@ class DahuaClient:
 
                 csrf = response.headers.get("X-csrftoken")
                 if csrf:
-                    self._raysharp_csrf = csrf
+                    holder.csrf = csrf
 
                 err_code = data.get("error_code") if isinstance(data, dict) else None
                 result = data.get("result") if isinstance(data, dict) else None
@@ -955,7 +1009,8 @@ class DahuaClient:
                         response.status,
                         err_code or result,
                     )
-                    self._raysharp_logged_in = False
+                    holder.logged_in = False
+                    holder.task = None
                     await self.async_login()
                     return await self.async_post_json(endpoint, payload, retry_on_auth_fail=False)
 
@@ -965,7 +1020,8 @@ class DahuaClient:
                 return data if isinstance(data, dict) else {"result": "success", "data": data}
         except aiohttp.ClientResponseError as err:
             if err.status == 401 and retry_on_auth_fail:
-                self._raysharp_logged_in = False
+                holder.logged_in = False
+                holder.task = None
                 await self.async_login()
                 return await self.async_post_json(endpoint, payload, retry_on_auth_fail=False)
             raise RaysharpApiError(f"HTTP error {err.status} for {endpoint}: {err}") from err
@@ -1694,6 +1750,9 @@ class DahuaClient:
         if self._rpc2_acquired and not self._rpc2_released:
             self._rpc2_released = True
             await _release_rpc2(self._rpc2_key())
+        if self._raysharp_acquired and not self._raysharp_released:
+            self._raysharp_released = True
+            await _release_raysharp(self._raysharp_key)
         session = self._rpc2_session_instance
         self._rpc2_session_instance = None
         if session is not None and not session.closed:

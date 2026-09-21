@@ -1138,7 +1138,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
 
     async def async_start_event_listener(self):
         """ Starts the event listeners for IP cameras (this does not work for doorbells (VTO)) """
-        if self.events is not None:
+        if self.events is not None and not self._raysharp:
             # Join this host's stream rather than opening another one. The
             # device sends every channel's events down any stream, so one is
             # enough no matter how many channels are configured.
@@ -1375,9 +1375,18 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                         data.update(sys_info)
                         data.update(version)
                         await self._async_init_raysharp(data)
-                except (RaysharpAuthError, RaysharpApiError) as err:
-                    _LOGGER.debug("Not a Raysharp device or login failed: %s", err)
-                    self.client.raysharp_mode = False
+                except RaysharpAuthError as err:
+                    _LOGGER.warning("Raysharp login rejected credentials for %s: %s", self._address, err)
+                    self.client.raysharp_mode = True
+                    raise UpdateFailed(f"Raysharp authentication error for {self._address}: {err}") from err
+                except RaysharpApiError as err:
+                    err_str = str(err)
+                    if "404" in err_str:
+                        _LOGGER.debug("Not a Raysharp device (%s): %s", self._address, err)
+                        self.client.raysharp_mode = False
+                    else:
+                        _LOGGER.warning("Raysharp connection error for %s: %s", self._address, err)
+                        raise UpdateFailed(f"Raysharp device at {self._address} connection error: {err}") from err
 
                 if not self.initialized:
                     # Find the max number of streams. 1 main stream + n number of sub-streams
