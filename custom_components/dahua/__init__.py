@@ -1627,6 +1627,10 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                     await self.async_start_vto_event_listener()
 
                 self.initialized = True
+            except RaysharpAuthError as exception:
+                _LOGGER.warning("Authentication failed for %s (%s), starting reauth", self._address, exception)
+                self.config_entry.async_start_reauth(self.hass)
+                raise UpdateFailed(f"Authentication failed for {self._address}: {exception}") from exception
             except ClientResponseError as exception:
                 if exception.status == 401:
                     _LOGGER.warning("Authentication failed for %s, starting reauth", self._address)

@@ -12,7 +12,7 @@ from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 from homeassistant.helpers import config_validation as cv
 
-from .client import DahuaClient
+from .client import DahuaClient, RaysharpAuthError
 from .const import (
     CONF_PASSWORD,
     CONF_USERNAME,
@@ -109,6 +109,8 @@ def describe_setup_failure(exception: BaseException) -> str:
     Only 401 and 403 are credentials. Everything else is the device not being
     where, or not being what, we were told.
     """
+    if isinstance(exception, RaysharpAuthError):
+        return "auth"
     if isinstance(exception, ClientResponseError):
         if exception.status in (401, 403):
             # Reachable only because get_machine_name and async_get_system_info
@@ -212,6 +214,7 @@ class DahuaFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                 entry.data[CONF_PORT],
                 entry.data[CONF_RTSP_PORT],
                 entry.data.get(CONF_CHANNEL, 0),
+                entry.data.get(CONF_USE_HTTPS),
             )
             if data is not None:
                 self.hass.config_entries.async_update_entry(

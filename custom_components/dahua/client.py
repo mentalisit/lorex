@@ -1279,7 +1279,9 @@ class DahuaClient:
                 or "Lorex NVR",
                 "_raw": data,
             }
-        except (RaysharpAuthError, RaysharpApiError) as err:
+        except RaysharpAuthError:
+            raise
+        except RaysharpApiError as err:
             _LOGGER.warning("Raysharp DeviceInfo failed: %s — deriving ID from credentials", err)
             self.identity_derived_from_credentials = True
             not_hashed_id = "{0}_{1}_{2}_{3}".format(
