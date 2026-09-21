@@ -2,15 +2,15 @@
   "domain": "lorex_raysharp",
   "name": "Lorex Raysharp NVR Integration",
   "after_dependencies": [
-    "tag",
-    "ffmpeg"
+    "tag"
   ],
   "codeowners": [
     "@rroller"
   ],
   "config_flow": true,
   "dependencies": [
-    "repairs"
+    "repairs",
+    "ffmpeg"
   ],
   "documentation": "https://github.com/rroller/dahua",
   "iot_class": "local_polling",

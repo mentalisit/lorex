@@ -958,6 +958,7 @@ class DahuaClient:
         channel_number is 1-based (channel index 0 → channel_number 1).
 
         Lorex RN101A returns JSON: ``{"result":"success","data":{"img_data":"<base64 jpeg>"}}``.
+        Returns empty bytes when the API is unavailable; caller falls back to RTSP.
         """
         ch_key = self.raysharp_channel_key(channel_number)
         payload = {"version": "1.0", "data": {"channel": ch_key}}
@@ -976,10 +977,10 @@ class DahuaClient:
                     or resp.get("image")
                 )
                 if not img_b64:
-                    _LOGGER.warning(
+                    _LOGGER.debug(
                         "Raysharp snapshot for %s returned no img_data: %s",
                         ch_key,
-                        list((data or {}).keys()) if data else resp.keys(),
+                        list((data or {}).keys()) if data else list(resp.keys()),
                     )
                     return b""
                 if isinstance(img_b64, str) and img_b64.startswith("data:"):
@@ -987,7 +988,7 @@ class DahuaClient:
                 return base64.b64decode(img_b64)
             return b""
         except RaysharpApiError as err:
-            _LOGGER.warning("Raysharp snapshot failed for channel %s: %s", ch_key, err)
+            _LOGGER.debug("Raysharp snapshot not available for channel %s: %s", ch_key, err)
             return b""
 
     def get_rtsp_stream_url(self, channel: int | str, subtype: int) -> str:
