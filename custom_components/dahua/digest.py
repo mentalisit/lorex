@@ -154,12 +154,15 @@ class DigestAuth:
         # refuse that, and 403 is what refusing it looks like.
         path = URL(url).raw_path_qs
 
-        # RFC 7616 userhash=true (Lorex / Raysharp OpenResty): the username
-        # used in A1 and in the Authorization header is H(username:realm).
+        # RFC 7616 userhash=true (Lorex / Raysharp OpenResty): only the username
+        # carried in the Authorization header is hashed, so the server can look
+        # the account up without the name crossing the wire. A1 keeps the plain
+        # username -- hashing it there produces a response the device reads as a
+        # wrong password, and a few of those lock the account out for 180s.
         use_userhash = str(self.challenge.get("userhash", "")).lower() == "true"
         auth_username = H("%s:%s" % (self.username, realm)) if use_userhash else self.username
 
-        A1 = "%s:%s:%s" % (auth_username, realm, self.password)
+        A1 = "%s:%s:%s" % (self.username, realm, self.password)
         A2 = "%s:%s" % (method, path)
 
         HA1 = H(A1)
@@ -196,6 +199,10 @@ class DigestAuth:
         else:
             response_digest = KD(HA1, "%s:%s" % (nonce, HA2))
 
+        # algorithm and qop are tokens, not quoted strings (RFC 7616 3.4), and
+        # a strict parser is entitled to read "MD5" with the quotes as an
+        # algorithm it does not have -- which is what a device that answers
+        # curl but not us looks like. This is byte-for-byte what curl sends.
         base = ", ".join(
             [
                 'username="%s"' % auth_username,
@@ -203,13 +210,13 @@ class DigestAuth:
                 'nonce="%s"' % nonce,
                 'uri="%s"' % path,
                 'response="%s"' % response_digest,
-                'algorithm="%s"' % algorithm,
+                "algorithm=%s" % algorithm,
             ]
         )
         if opaque:
             base += ', opaque="%s"' % opaque
         if qop:
-            base += ', qop="auth", nc=%s, cnonce="%s"' % (ncvalue, cnonce)
+            base += ', qop=auth, nc=%s, cnonce="%s"' % (ncvalue, cnonce)
         if use_userhash:
             base += ", userhash=true"
 

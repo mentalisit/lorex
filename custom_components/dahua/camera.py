@@ -10,9 +10,9 @@ from homeassistant.helpers import entity_platform
 from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.components.ffmpeg import async_get_image
 
-from custom_components.dahua import DahuaDataUpdateCoordinator
-from custom_components.dahua.entity import DahuaBaseEntity
-from custom_components.dahua.model_profiles import is_sdt4e425
+from . import DahuaDataUpdateCoordinator
+from .entity import DahuaBaseEntity
+from .model_profiles import is_sdt4e425
 
 from .const import (
     DOMAIN,

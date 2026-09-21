@@ -269,6 +269,65 @@ async def test_the_signed_uri_is_the_encoded_form():
     assert "[3]" not in uri, "the header still names the decoded path"
 
 
+# --- RFC 7616 username hashing (Lorex / Raysharp) -----------------------------
+
+
+class UserhashSession(FakeSession):
+    """A device that offers userhash=true and verifies the RFC 7616 way.
+
+    The username on the wire is H(username:realm); the response is still
+    computed from A1 over the plain username, which is how the device knows
+    the password. Hashing the name in A1 as well reads as a wrong password,
+    and the RN101A locks the account for 180 seconds after a few of those.
+    """
+
+    def _challenge(self, stale=False):
+        headers = super()._challenge(stale)
+        headers["www-authenticate"] += ', userhash="true"'
+        return headers
+
+    async def request(self, method, url, headers=None, **kwargs):
+        headers = headers or {}
+        self.requests.append({"method": method, "url": url, "headers": dict(headers)})
+        auth = headers.get("AUTHORIZATION")
+        if not auth:
+            return FakeResponse(401, self._challenge())
+
+        params = _params(auth)
+        hashed = hashlib.md5(("%s:%s" % (USER, REALM)).encode()).hexdigest()
+        assert params["username"] == hashed, "the plain username went on the wire"
+        assert params.get("userhash") == "true"
+        if params.get("nonce") != self.nonce:
+            return FakeResponse(401, self._challenge(stale=True))
+        # Verified against the plain username, as the device does.
+        expected = _expected_response(
+            method.upper(), dict(params, username=USER), self.password
+        )
+        if params.get("response") != expected:
+            return FakeResponse(401, self._challenge())
+        return FakeResponse(200, body=self.body)
+
+
+async def test_algorithm_and_qop_go_on_the_wire_as_tokens():
+    """RFC 7616 3.4: quoting either is an error a strict parser may refuse on."""
+    session = FakeSession()
+
+    await DigestAuth(USER, PASSWORD, session, {}).request("GET", "http://d/x")
+
+    header = session.requests[-1]["headers"]["AUTHORIZATION"]
+    assert "algorithm=MD5," in header
+    assert "qop=auth," in header
+    assert 'algorithm="' not in header and 'qop="' not in header
+
+
+async def test_userhash_hides_the_name_but_signs_the_plain_one():
+    session = UserhashSession()
+
+    response = await DigestAuth(USER, PASSWORD, session, {}).request("GET", "http://d/x")
+
+    assert response.status == 200, "the device read the digest as a wrong password"
+
+
 async def test_a_url_without_brackets_is_unaffected():
     """Nothing changes for the URLs that have no character needing encoding."""
     session = FakeSession(strict_uri=True)
